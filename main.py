@@ -3699,10 +3699,16 @@ class MuzykaApp(App):
         video = job["kind"] == "video"
         if video:
             self.video_dir().mkdir(parents=True, exist_ok=True)
+        # Android (APK) nie pozwala zapisywać plików .part w Music/Movies -
+        # pliki tymczasowe idą do prywatnego folderu, gotowy plik jest przenoszony.
+        tmp_dl = Path(self.user_data_dir) / "tmp_dl"
+        tmp_dl.mkdir(parents=True, exist_ok=True)
         opts = {
             "format": VIDEO_FORMAT if video else FORMATS.get(quality, FORMATS["najlepsza"]),
-            "outtmpl": str(self.video_dir() / "%(title)s [%(id)s].%(ext)s" if video else
-                           self.dl_dir / "%(artist,uploader)s - %(title)s [%(id)s].%(ext)s"),
+            "outtmpl": ("%(title)s [%(id)s].%(ext)s" if video else
+                        "%(artist,uploader)s - %(title)s [%(id)s].%(ext)s"),
+            "paths": {"home": str(self.video_dir() if video else self.dl_dir),
+                      "temp": str(tmp_dl)},
             "windowsfilenames": True,   # Android nie przyjmuje : ? " | * < > w nazwach
             "trim_file_name": 150,
             "noplaylist": True,
