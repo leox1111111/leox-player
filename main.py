@@ -1698,6 +1698,7 @@ class RemotePlayer:
         self.mp = self.snd = None
         self.st = {"pos": 0.0, "dur": 0.0, "playing": False, "t": time.time()}
         self.last_toggle = 0.0
+        self.alive, self.pending = False, []   # polecenia czekają, aż usługa wystartuje
         self.local = Player()                  # korektor (lista ustawień) i quiz
         self.MP, self.PP, self.EQ = self.local.MP, self.local.PP, self.local.EQ
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1718,6 +1719,11 @@ class RemotePlayer:
                 msg = json.loads(data.decode("utf-8"))
             except Exception:
                 continue
+            if not self.alive:
+                self.alive = True
+                for kw in self.pending:
+                    self._send(kw)
+                self.pending = []
             if msg.get("event") == "status":
                 self.st.update(pos=msg.get("pos", 0), dur=msg.get("dur", 0),
                                playing=msg.get("playing", False), t=time.time())
@@ -1726,6 +1732,12 @@ class RemotePlayer:
             Clock.schedule_once(lambda dt, m=msg: self.on_msg(m))
 
     def cmd(self, **kw):
+        if not self.alive:
+            self.pending = self.pending[-30:] + [kw]
+            return
+        self._send(kw)
+
+    def _send(self, kw):
         try:
             self.sock.sendto(json.dumps(kw).encode("utf-8"), ("127.0.0.1", self.SVC_PORT))
         except Exception:
@@ -2829,6 +2841,7 @@ class MuzykaApp(App):
         if self.apk:
             self.player.apply_fx()
             Clock.schedule_once(lambda dt: self.player.cmd(cmd="hello"), 1.0)
+            Clock.schedule_once(self.check_service, 12)
         else:
             self.player.on_done = self.bg_done
         self.view, self.pl_id, self.group = "Biblioteka", None, None
@@ -3343,6 +3356,19 @@ class MuzykaApp(App):
         if self.is_stream(t[0]):
             return t[3] if str(t[3]).startswith("http") else ""
         return None
+
+    def check_service(self, *_):
+        """Usługa w tle nie odpowiedziała - gramy w samej aplikacji."""
+        if not self.apk or self.player.alive:
+            return
+        rp = self.player
+        self.apk = False
+        self.player = Player()
+        self.player.eq_preset, self.player.bass, self.player.eq_bands = rp.eq_preset, rp.bass, rp.eq_bands
+        self.player.on_done = self.bg_done
+        self.set_status("Odtwarzanie w tle niedostępne - gram w aplikacji")
+        if any(k.get("cmd") == "play" for k in rp.pending) and 0 <= self.qi < len(self.queue):
+            self.play_current()
 
     def on_remote(self, msg):
         """Wiadomości z usługi odtwarzania."""
