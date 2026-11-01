@@ -2826,7 +2826,7 @@ class MuzykaApp(App):
         self.lib = Library(Path(self.user_data_dir) / "library.db", dirs)
         apply_theme(self.lib.get_setting("motyw", "Ciepły"))
         Window.clearcolor = BG
-        self.apk = service_available()
+        self.apk = self.apk_build = service_available()
         self.player = RemotePlayer(self.on_remote) if self.apk else Player()
         self.player.eq_preset = int(self.lib.get_setting("eq", "-1"))
         self.player.bass = int(self.lib.get_setting("bas", "0"))
@@ -2873,6 +2873,8 @@ class MuzykaApp(App):
         Clock.schedule_interval(self.viz_tick, 1 / 15)
         Clock.schedule_interval(self.fx_tick, 1 / 30)
         Clock.schedule_once(lambda dt: self.scan(), 0.5)
+        Clock.schedule_interval(self.autobackup, 30)
+        Clock.schedule_once(self.ask_all_files, 2)
         if self.lib.get_setting("auto_nowosci", "0") == "1":
             Clock.schedule_once(lambda dt: self.auto_news(), 8)
         return root
@@ -3442,6 +3444,8 @@ class MuzykaApp(App):
 
     def on_resume(self):
         self.in_bg = False
+        if time.time() - getattr(self, "last_scan", 0) > 20:
+            Clock.schedule_once(lambda dt: self.scan(), 0.3)   # nowe pliki, przyznany dostęp
         if self.bg_changed and not self.apk:
             self.bg_changed = False
             if self.sleep_end_track:
@@ -3641,13 +3645,136 @@ class MuzykaApp(App):
     def scan(self):
         self.set_status("Skanowanie...")
 
+        self.last_scan = time.time()
+
         def done(res):
             if isinstance(res, Exception):
                 self.set_status(f"Błąd skanu: {res}")
             else:
                 self.set_status(f"Skan: +{res[0]} / -{res[1]}")
+                if not getattr(self, "restore_checked", False):
+                    self.auto_restore()
             self.refresh()
         self.run_bg(self.lib.scan, done)
+
+    # --- automatyczna kopia playlist (przetrwa odinstalowanie aplikacji)
+    def autobackup_file(self):
+        return self.export_dir / "Leox Player" / "leox-autokopia.json"
+
+    @staticmethod
+    def backup_has_data(d):
+        return any(d.get(k) for k in ("playlists", "favorites", "channels", "stations", "podcasts"))
+
+    def autobackup(self, *_):
+        """Zapisuje playlisty, ulubione, kanały, stacje i podcasty do Music/Leox Player."""
+        if not getattr(self, "restore_checked", False):
+            return                      # najpierw sprawdzamy, czy jest kopia do wczytania
+        try:
+            data = self.backup_payload()
+        except Exception:
+            return
+        if data == getattr(self, "_last_backup", None):
+            return
+        f = self.autobackup_file()
+        try:
+            if not self.backup_has_data(json.loads(data)) and f.exists():
+                return                  # pusta biblioteka nie nadpisuje dobrej kopii
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(data, encoding="utf-8")
+            self._last_backup = data
+        except (OSError, ValueError):
+            pass
+
+    def auto_restore(self):
+        """Nowa (pusta) biblioteka, np. po reinstalacji: wczytuje playlisty z kopii."""
+        lib = self.lib
+        if not lib.tracks():
+            return                      # brak dostępu do plików albo pusty folder - spróbujemy po kolejnym skanie
+        self.restore_checked = True
+        if lib.playlists() or lib.favorites() or lib.channels() or lib.stations() or lib.podcasts():
+            return
+        n = 0
+        cands = [self.autobackup_file()]
+        try:
+            cands += sorted(self.export_dir.glob("leox-kopia-*.json"), reverse=True)
+        except OSError:
+            pass
+        for f in cands:
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+                assert d.get("leox") == 1 and self.backup_has_data(d)
+            except Exception:
+                continue
+            n = self.apply_backup(d)
+            break
+        try:
+            m3u = (self.export_dir / "Playlisty").is_dir() and any(
+                (self.export_dir / "Playlisty").glob("*.m3u*"))
+        except OSError:
+            m3u = False
+        if m3u and not lib.playlists():
+            self.import_m3u()
+        elif n:
+            self.set_status(f"Wczytano playlisty i ulubione z kopii ({n} poz.)")
+        self.refresh()
+
+    def apply_backup(self, d):
+        idx = {((r[1] or "").casefold(), (r[2] or "").casefold()): r[0] for r in self.lib.tracks()}
+        n = 0
+        for name, items in d.get("playlists", {}).items():
+            have = set()
+            for t_, a in items:
+                p_ = idx.get((t_.casefold(), a.casefold()))
+                if p_ and p_ not in have:
+                    self.lib.add_to_playlist(name, p_)
+                    have.add(p_)
+                    n += 1
+        for t_, a in d.get("favorites", []):
+            p_ = idx.get((t_.casefold(), a.casefold()))
+            if p_:
+                self.lib.set_fav(p_, True)
+                n += 1
+        for u, nm in d.get("channels", []):
+            self.lib.save_channel(u, nm)
+        for u, nm, ic in d.get("stations", []):
+            self.lib.save_station(u, nm, ic)
+        for u, tt, im in d.get("podcasts", []):
+            self.lib.save_podcast(u, tt, im)
+        return n
+
+    def ask_all_files(self, *_):
+        """APK na Androidzie 11+: dostęp do wszystkich plików (jak w Pydroid),
+        żeby widzieć całą muzykę i kopię playlist po reinstalacji."""
+        if not self.apk_build or self.lib.get_setting("nie_pytaj_pliki", "0") == "1":
+            return
+        try:
+            from jnius import autoclass
+            Build = autoclass("android.os.Build$VERSION")
+            if Build.SDK_INT < 30 or autoclass("android.os.Environment").isExternalStorageManager():
+                return
+        except Exception:
+            return
+
+        def open_settings(b):
+            try:
+                from jnius import autoclass
+                Intent = autoclass("android.content.Intent")
+                Settings = autoclass("android.provider.Settings")
+                Uri = autoclass("android.net.Uri")
+                ctx = android_context()
+                it = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:" + ctx.getPackageName()))
+                it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(it)
+            except Exception as e:
+                self.set_status(f"Nie udało się otworzyć ustawień: {e}")
+
+        def never(b):
+            self.lib.set_setting("nie_pytaj_pliki", "1")
+        self.list_popup("Dostęp do plików", [
+            {"text": "Włącz dostęp do wszystkich plików\n(cała muzyka i kopia playlist)",
+             "tap": open_settings, "h": 90},
+            {"text": "Nie pytaj więcej", "tap": never}])
 
     def download(self, url, btn=None, on_done=None, quiet=False, kind="yt",
                  title=None, dest=None):
@@ -4880,6 +5007,7 @@ class MuzykaApp(App):
 
     def on_pause(self):
         self.in_bg = True
+        self.autobackup()
         return True                             # muzyka gra dalej po wyjściu z aplikacji
 
     def setup_fx(self):
@@ -6036,27 +6164,7 @@ class MuzykaApp(App):
                 self.set_status("To nie jest kopia Leox Player")
                 return
             pop.dismiss()
-            idx = {((r[1] or "").casefold(), (r[2] or "").casefold()): r[0] for r in self.lib.tracks()}
-            n = 0
-            for name, items in d.get("playlists", {}).items():
-                have = set()
-                for t_, a in items:
-                    p_ = idx.get((t_.casefold(), a.casefold()))
-                    if p_ and p_ not in have:
-                        self.lib.add_to_playlist(name, p_)
-                        have.add(p_)
-                        n += 1
-            for t_, a in d.get("favorites", []):
-                p_ = idx.get((t_.casefold(), a.casefold()))
-                if p_:
-                    self.lib.set_fav(p_, True)
-                    n += 1
-            for u, nm in d.get("channels", []):
-                self.lib.save_channel(u, nm)
-            for u, nm, ic in d.get("stations", []):
-                self.lib.save_station(u, nm, ic)
-            for u, tt, im in d.get("podcasts", []):
-                self.lib.save_podcast(u, tt, im)
+            n = self.apply_backup(d)
             self.refresh()
             self.set_status(f"Przywrócono: {n} pozycji playlist i ulubionych + kanały, radio, podcasty")
         self.form_popup("Przywróć kopię",
