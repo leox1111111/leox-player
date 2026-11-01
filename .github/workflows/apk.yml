@@ -52,6 +52,7 @@ jobs:
           warn_on_root = 1
           SPEC
           sed -i 's/^          //' buildozer.spec
+          if [ -f icon.png ]; then sed -i 's|^\[app\]$|[app]\nicon.filename = %(source.dir)s/icon.png|' buildozer.spec; fi
       - name: Budowanie
         run: yes | buildozer android debug 2>&1 | tee build.log; test -n "$(ls bin/*.apk 2>/dev/null)"
       - uses: actions/upload-artifact@v4
