@@ -1,0 +1,62 @@
+name: Leox Player APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ hashFiles('.github/workflows/apk.yml') }}-v1
+      - name: Zaleznosci
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip unzip autoconf automake libtool libtool-bin pkg-config \
+            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential lld
+          pip install buildozer "cython<3.1" setuptools
+      - name: Konfiguracja
+        run: |
+          echo 'android:usesCleartextTraffic="true"' > manifest_extra.xml
+          cat > buildozer.spec <<'SPEC'
+          [app]
+          title = Leox Player
+          package.name = leoxplayer
+          package.domain = pl.leox
+          source.dir = .
+          source.include_exts = py,png,jpg,kv,ttf
+          source.exclude_dirs = .github,bin,.buildozer
+          version = 1.0
+          requirements = python3,kivy==2.3.1,pyjnius,android,openssl,sqlite3,yt-dlp,mutagen,certifi,qrcode,ffpyplayer
+          orientation = portrait
+          fullscreen = 0
+          android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CHANGE_WIFI_MULTICAST_STATE,WAKE_LOCK,READ_MEDIA_AUDIO,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,POST_NOTIFICATIONS,RECORD_AUDIO
+          android.api = 34
+          android.minapi = 24
+          android.archs = arm64-v8a
+          android.accept_sdk_license = True
+          android.extra_manifest_application_arguments = manifest_extra.xml
+
+          [buildozer]
+          log_level = 2
+          warn_on_root = 1
+          SPEC
+          sed -i 's/^          //' buildozer.spec
+      - name: Budowanie
+        run: yes | buildozer android debug 2>&1 | tee build.log; test -n "$(ls bin/*.apk 2>/dev/null)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: leox-player-apk
+          path: |
+            bin/*.apk
+            build.log
