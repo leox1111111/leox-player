@@ -68,7 +68,7 @@ MUSIC_DIR = _SD if _SD.exists() else Path.home() / "Music"
 YT_ID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 VIDEO_FORMAT = ("best[ext=mp4][vcodec!=none][acodec!=none][height<=720]"
                 "/best[vcodec!=none][acodec!=none]/18")
-EXT = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac"}
+EXT = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac", ".webm"}
 
 # ciepła, ciemna paleta
 BG = (0.10, 0.08, 0.07, 1)
@@ -311,6 +311,48 @@ class _QuietLogger:
 
 
 QUIET = _QuietLogger()
+
+
+YT_FALLBACK_CLIENTS = (["android_vr"], ["tv", "web_safari"], ["mweb", "web_embedded"])
+YT_RETRY_ERRORS = ("format is not available", "sign in to confirm", "no video formats",
+                   "only images are available", "not a bot", "javascript")
+
+
+def patch_ytdlp():
+    """Bez silnika JavaScript (telefon) YouTube czasem nie podaje formatów.
+    Wtedy ponawiamy pobranie przez inne klienty YouTube, które go nie wymagają."""
+    try:
+        import yt_dlp
+    except ImportError:
+        return
+    if getattr(yt_dlp.YoutubeDL, "_leox_patch", False):
+        return
+    orig = yt_dlp.YoutubeDL.extract_info
+
+    def extract_info(self, url, *a, **kw):
+        try:
+            return orig(self, url, *a, **kw)
+        except yt_dlp.utils.DownloadError as e:
+            low = str(e).lower()
+            if "youtu" not in str(url) or not any(s in low for s in YT_RETRY_ERRORS):
+                raise
+            last = e
+        for clients in YT_FALLBACK_CLIENTS:
+            p = dict(self.params)
+            ea = {k: dict(v) for k, v in (p.get("extractor_args") or {}).items()}
+            ea.setdefault("youtube", {})["player_client"] = clients
+            p["extractor_args"] = ea
+            if p.get("format") and "/best" not in p["format"].replace("/bestaudio[", ""):
+                p["format"] = p["format"] + "/bestaudio/18/best"
+            try:
+                with yt_dlp.YoutubeDL(p) as y2:
+                    return orig(y2, url, *a, **kw)
+            except yt_dlp.utils.DownloadError as e2:
+                last = e2
+        raise last
+
+    yt_dlp.YoutubeDL.extract_info = extract_info
+    yt_dlp.YoutubeDL._leox_patch = True
 
 
 def open_external(url):
@@ -1081,6 +1123,8 @@ class Library:
         found, rows = set(), []
         for top in self.dirs:
             for root, _, files in os.walk(top):
+                if Path(root).name == "Filmy":        # pobrane filmy to nie muzyka
+                    continue
                 for name in files:
                     p = Path(root) / name
                     if p.suffix.lower() not in EXT:
@@ -2815,6 +2859,7 @@ class MuzykaApp(App):
 
     def build(self):
         self.title = "Leox Player"
+        threading.Thread(target=patch_ytdlp, daemon=True).start()
         request_perms()
         Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
         setup_font(Path(self.user_data_dir) / "fonts")
@@ -3879,6 +3924,14 @@ class MuzykaApp(App):
         if video:
             job["pct"] = 100
             return job["title"]
+        try:                                      # zapasowy klient YouTube daje czasem .mp4 z dźwiękiem
+            rd = info["requested_downloads"][0]
+            if Path(rd["filepath"]).suffix.lower() == ".mp4":
+                new = Path(rd["filepath"]).with_suffix(".m4a")
+                os.replace(rd["filepath"], new)
+                rd["filepath"] = str(new)
+        except Exception:
+            pass
         try:
             fp = info["requested_downloads"][0]["filepath"]
             t_title, t_artist = split_name(Path(fp).stem)
@@ -4131,8 +4184,14 @@ class MuzykaApp(App):
             return "YouTube żąda weryfikacji. Spróbuj później albo przez inną sieć (Wi-Fi/LTE)."
         if "no module named" in low:
             return "Brak modułu. Zainstaluj w Pip: yt-dlp"
+        apk = service_available()
         if "format" in low or "javascript" in low or "unavailable" in low:
+            if apk:
+                return ("YouTube nie udostępnił tego nagrania (próbowano kilku metod). "
+                        "Spróbuj później albo zbuduj APK od nowa - pobierze najnowszy yt-dlp.")
             return "Zaktualizuj yt-dlp w Pip (Upgrade), potem uruchom aplikację ponownie."
+        if apk:
+            return "Spróbuj ponownie. Jeśli błąd wraca, zbuduj APK od nowa (najnowszy yt-dlp)."
         return "Zaktualizuj yt-dlp w Pip i spróbuj ponownie."
 
     def show_error(self, err, title="Błąd pobierania"):

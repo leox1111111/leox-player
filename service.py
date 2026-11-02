@@ -57,6 +57,48 @@ class Quiet:
     info = warning = error = debug
 
 
+YT_FALLBACK_CLIENTS = (["android_vr"], ["tv", "web_safari"], ["mweb", "web_embedded"])
+YT_RETRY_ERRORS = ("format is not available", "sign in to confirm", "no video formats",
+                   "only images are available", "not a bot", "javascript")
+
+
+def patch_ytdlp():
+    """Bez silnika JavaScript (telefon) YouTube czasem nie podaje formatów.
+    Wtedy ponawiamy pobranie przez inne klienty YouTube, które go nie wymagają."""
+    try:
+        import yt_dlp
+    except ImportError:
+        return
+    if getattr(yt_dlp.YoutubeDL, "_leox_patch", False):
+        return
+    orig = yt_dlp.YoutubeDL.extract_info
+
+    def extract_info(self, url, *a, **kw):
+        try:
+            return orig(self, url, *a, **kw)
+        except yt_dlp.utils.DownloadError as e:
+            low = str(e).lower()
+            if "youtu" not in str(url) or not any(s in low for s in YT_RETRY_ERRORS):
+                raise
+            last = e
+        for clients in YT_FALLBACK_CLIENTS:
+            p = dict(self.params)
+            ea = {k: dict(v) for k, v in (p.get("extractor_args") or {}).items()}
+            ea.setdefault("youtube", {})["player_client"] = clients
+            p["extractor_args"] = ea
+            if p.get("format") and "/best" not in p["format"].replace("/bestaudio[", ""):
+                p["format"] = p["format"] + "/bestaudio/18/best"
+            try:
+                with yt_dlp.YoutubeDL(p) as y2:
+                    return orig(y2, url, *a, **kw)
+            except yt_dlp.utils.DownloadError as e2:
+                last = e2
+        raise last
+
+    yt_dlp.YoutubeDL.extract_info = extract_info
+    yt_dlp.YoutubeDL._leox_patch = True
+
+
 def is_stream(p):
     return bool(p) and (p.startswith("http") or p.startswith("radio:"))
 
@@ -617,4 +659,5 @@ class Usluga:
                 time.sleep(0.1)
 
 
+patch_ytdlp()
 Usluga().run()
