@@ -4347,6 +4347,10 @@ class MuzykaApp(App):
                 im = TapImage(size_hint_x=None, width=dp(92), fit_mode="contain")
                 self.net_image(r["image"], im)
                 line.add_widget(im)
+            elif "avatar" in r:
+                im = TapImage(size_hint_x=None, width=dp(64), fit_mode="contain")
+                self.online_avatar(r["avatar"], im)
+                line.add_widget(im)
             b = RoundButton(text=r["text"], halign="left", valign="middle",
                             markup=r.get("markup", False), max_lines=3)
             if "bg" in r:
@@ -8478,19 +8482,19 @@ class Supa:
         return self.req("POST", f"/rest/v1/rpc/{fn}", args or {})
 
     # --- pliki
-    def upload(self, obj, path, mime):
+    def upload(self, obj, path, mime, bucket="music"):
         data = Path(path).read_bytes()
-        self.req("POST", f"/storage/v1/object/music/{urllib.parse.quote(obj)}", data=data,
+        self.req("POST", f"/storage/v1/object/{bucket}/{urllib.parse.quote(obj)}", data=data,
                  headers={"Content-Type": mime, "x-upsert": "false"}, timeout=600)
         return len(data)
 
-    def remove_object(self, obj):
-        self.req("DELETE", "/storage/v1/object/music", {"prefixes": [obj]})
+    def remove_object(self, obj, bucket="music"):
+        self.req("DELETE", f"/storage/v1/object/{bucket}", {"prefixes": [obj]})
 
-    def signed_urls(self, objs, expires=12 * 3600):
+    def signed_urls(self, objs, expires=12 * 3600, bucket="music"):
         if not objs:
             return {}
-        res = self.req("POST", "/storage/v1/object/sign/music",
+        res = self.req("POST", f"/storage/v1/object/sign/{bucket}",
                        {"expiresIn": expires, "paths": list(objs)}) or []
         out = {}
         for r in res:
@@ -8550,10 +8554,12 @@ class OnlinePlus:
             self.online_me, self.online_settings = me, st
             if me is None:
                 self.online_lock("Konto nie istnieje albo zostało usunięte.", relogin=True)
-            elif me["status"] == "banned":
+            elif me["status"] == "banned" and not ban_expired(me):
                 msg = "Zostałeś zablokowany przez administratora."
                 if me.get("ban_reason"):
                     msg += f"\nPowód: {me['ban_reason']}"
+                if me.get("ban_until"):
+                    msg += f"\nDo: {local_time(me['ban_until'])}"
                 self.lib.set_setting("blokada", msg)      # zostaje po wylogowaniu
                 self.online_lock(msg, relogin=True)
             elif st.get("maintenance") and me.get("role") != "admin":
@@ -8685,7 +8691,7 @@ class OnlinePlus:
 
     def is_active_user(self):
         me = getattr(self, "online_me", None)
-        return bool(me and me.get("status") == "active")
+        return bool(me and (me.get("status") == "active" or ban_expired(me)))
 
     def show_online(self):
         if not self.online_ready():
@@ -8702,13 +8708,19 @@ class OnlinePlus:
               "banned": "zablokowane"}.get(me.get("status"), "?")
         rows = [{"text": f"{name}  (@{me.get('username', '?')})\nKonto: {st}"
                          f"{'  -  ADMIN' if self.is_admin() else ''}",
-                 "tap": lambda b: self.online_edit_profile(), "h": 80}]
+                 "tap": lambda b: self.online_edit_profile(), "h": 80,
+                 "avatar": me.get("avatar_path", "")}]
         if self.is_active_user():
             rows += [{"text": "Czat publiczny", "tap": lambda b: self.online_chat()},
                      {"text": "Wspólna muzyka", "tap": lambda b: self.online_music()},
+                     {"text": "Kto jest online", "tap": lambda b: self.online_who()},
                      {"text": "Użytkownicy", "tap": lambda b: self.online_users("active")}]
-        rows += [{"text": "Mój profil", "tap": lambda b: self.online_edit_profile()},
-                 {"text": "Zmień hasło", "tap": lambda b: self.online_password()}]
+        rows += [{"text": "Mój profil (nazwa, opis)", "tap": lambda b: self.online_edit_profile()},
+                 {"text": "Ustaw zdjęcie profilowe", "tap": lambda b: self.online_set_avatar()}]
+        if me.get("avatar_path"):
+            rows.append({"text": "Usuń zdjęcie profilowe",
+                         "tap": lambda b: self.online_remove_avatar(me)})
+        rows.append({"text": "Zmień hasło", "tap": lambda b: self.online_password()})
         if self.is_admin():
             rows.append({"text": "PANEL ADMINA", "tap": lambda b: self.online_admin(),
                          "bg": list(ACCENT_DIM)})
@@ -8752,9 +8764,16 @@ class OnlinePlus:
             tags.append("wyciszony")
         if p.get("status") != "active":
             tags.append({"pending": "oczekuje", "banned": "zablokowany"}.get(p.get("status"), ""))
+        if is_online(p):
+            tags.append("online")
         rows = [{"text": f"{p.get('display_name') or p.get('username')}  (@{p.get('username')})"
                          f"{'  [' + ', '.join(tags) + ']' if tags else ''}\nOd: {joined}",
-                 "tap": lambda b: None, "h": 80}]
+                 "tap": lambda b: self.online_big_avatar(p), "h": 110,
+                 "avatar": p.get("avatar_path", "")}]
+        if p.get("status") == "banned" and (p.get("ban_reason") or p.get("ban_until")):
+            rows.append({"text": f"Ban: {p.get('ban_reason') or '-'}\n"
+                                 f"Do: {local_time(p['ban_until']) if p.get('ban_until') else 'na zawsze'}",
+                         "tap": lambda b: None, "h": 80})
         if p.get("bio"):
             rows.append({"text": p["bio"], "tap": lambda b: None, "h": 100})
         if self.is_admin() and p.get("id") != self.supa.uid:
@@ -8776,7 +8795,7 @@ class OnlinePlus:
         sv.add_widget(grid)
         box.add_widget(sv)
         bar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(4))
-        ti = RoundInput(hint_text="Napisz wiadomość...", multiline=False)
+        ti = RoundInput(hint_text="Napisz wiadomość... (@nazwa = wzmianka)", multiline=False)
         send = RoundButton(text="Wyślij", size_hint_x=None, width=dp(90), bg=list(ACCENT_DIM))
         close = RoundButton(text="X", size_hint_x=None, width=dp(56), bg=list(CARD_HI))
         bar.add_widget(ti)
@@ -8792,14 +8811,25 @@ class OnlinePlus:
             when = (m.get("created_at") or "")[11:16]
             badge = " [color=#e08f52](admin)[/color]" if p.get("role") == "admin" else ""
             text = "[i]wiadomość usunięta[/i]" if m.get("deleted") else escape_markup(m["content"])
+            me_name = "@" + ((self.online_me or {}).get("username") or "~")
+            if not m.get("deleted") and me_name.lower() in m["content"].lower():
+                text = f"[color=#e08f52][b]{text}[/b][/color]"       # ktoś Cię wspomniał
+            row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+            av = TapImage(size_hint=(None, None), size=(dp(40), dp(40)), fit_mode="contain",
+                          pos_hint={"top": 1})
+            self.online_avatar(p.get("avatar_path", ""), av)
+            av.bind(on_release=lambda *_: self.online_open_profile(m["user_id"]))
             line = ChatLine(text=f"[b]{name}[/b]{badge}  [size=11sp]{when}[/size]\n{text}",
                             markup=True, color=TEXT if not m.get("deleted") else MUTED,
                             font_size="15sp", halign="left", valign="top", size_hint_y=None)
             line.bind(width=lambda w, v: setattr(w, "text_size", (v - dp(8), None)),
-                      texture_size=lambda w, v: setattr(w, "height", v[1] + dp(8)))
+                      texture_size=lambda w, v: (setattr(w, "height", v[1] + dp(8)),
+                                                 setattr(row, "height", max(dp(48), v[1] + dp(8)))))
             line.bind(on_release=lambda *_: self.online_msg_menu(m, st["profiles"][m["user_id"]],
                                                                  lambda: refresh(True)))
-            grid.add_widget(line)
+            row.add_widget(av)
+            row.add_widget(line)
+            grid.add_widget(row)
 
         def refresh(full=False):
             if st["busy"] or not st["open"]:
@@ -8811,7 +8841,7 @@ class OnlinePlus:
 
             def work():
                 sel = "select=id,content,created_at,deleted,user_id," \
-                      "profiles(username,display_name,role)"
+                      "profiles(username,display_name,role,avatar_path)"
                 if last:
                     msgs = supa.select("messages", f"{sel}&id=gt.{last}&order=id.asc&limit=100")
                 else:
@@ -8926,7 +8956,8 @@ class OnlinePlus:
         footer = [("Graj wszystko", lambda b: cache.get("rows") and
                    self.online_play_shared(cache["rows"], 0))]
         if admin:
-            footer.append(("Dodaj z telefonu", lambda b: self.online_pick_upload()))
+            footer.append(("Z biblioteki", lambda b: self.online_pick_upload()))
+            footer.append(("Z pliku", lambda b: self.online_upload_file()))
         self.live_search_popup("Wspólna muzyka", "Szukaj na serwerze", fetch, footer,
                                empty_msg="Brak utworów na serwerze")
 
@@ -8989,7 +9020,7 @@ class OnlinePlus:
         self.live_search_popup("Wyślij na serwer", "Szukaj w swojej bibliotece", fetch,
                                empty_msg="Brak plików w bibliotece")
 
-    def online_upload(self, t):
+    def online_upload(self, t, cleanup=False):
         path = Path(t[0])
         ext = path.suffix.lower()
         mime = AUDIO_MIME.get(ext)
@@ -9017,6 +9048,12 @@ class OnlinePlus:
             except Exception:
                 self.supa.remove_object(obj)
                 raise
+            finally:
+                if cleanup:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
             return True
         self.online_do(work, f"Wysłano na serwer: {t[1]}")
 
@@ -9026,6 +9063,8 @@ class OnlinePlus:
         maint = bool(s.get("maintenance"))
         rows = [
             {"text": "Statystyki", "tap": lambda b: self.online_stats()},
+            {"text": "Kto jest online", "tap": lambda b: self.online_who()},
+            {"text": "Dziennik admina (kto co zmienił)", "tap": lambda b: self.online_admin_log()},
             {"text": "Oczekujące konta (akceptacja)", "tap": lambda b: self.online_users("pending")},
             {"text": "Aktywni użytkownicy", "tap": lambda b: self.online_users("active")},
             {"text": "Zablokowani (unban)", "tap": lambda b: self.online_users("banned")},
@@ -9066,18 +9105,23 @@ class OnlinePlus:
                     tags.append("admin")
                 if p.get("muted"):
                     tags.append("wyciszony")
-                if p.get("last_seen") and status == "active":
-                    tags.append("widziany " + p["last_seen"][:16].replace("T", " "))
-                extra = f"\nPowód: {p['ban_reason']}" if status == "banned" and p.get("ban_reason") \
-                    else ("\n" + ", ".join(tags) if tags else "")
-                r = {"text": f"{p.get('display_name') or p['username']}  (@{p['username']}){extra}",
-                     "tap": lambda b, p=p: self.online_profile_popup(p), "h": 80}
+                if p.get("last_seen") and status == "active" and not is_online(p):
+                    tags.append("widziany " + local_time(p["last_seen"]))
+                if status == "banned":
+                    extra = (f"\nPowód: {p.get('ban_reason') or '-'}  do: "
+                             f"{local_time(p['ban_until']) if p.get('ban_until') else 'na zawsze'}")
+                else:
+                    extra = "\n" + ", ".join(tags) if tags else ""
+                dot = "  [online]" if is_online(p) else ""
+                r = {"text": f"{p.get('display_name') or p['username']}  (@{p['username']}){dot}{extra}",
+                     "tap": lambda b, p=p: self.online_profile_popup(p), "h": 80,
+                     "avatar": p.get("avatar_path", "")}
                 if self.is_admin() and status == "pending":
                     r["sides"] = [("OK", lambda b, p=p: self.online_set(
                         p, {"status": "active"}, "Zatwierdzono"))]
                 if self.is_admin() and status == "banned":
                     r["sides"] = [("Unban", lambda b, p=p: self.online_set(
-                        p, {"status": "active", "ban_reason": ""}, "Odblokowano"))]
+                        p, {"status": "active", "ban_reason": "", "ban_until": None}, "Odblokowano"))]
                 rows.append(r)
             if not rows:
                 rows = [{"text": "Brak", "tap": lambda b: None}]
@@ -9092,12 +9136,13 @@ class OnlinePlus:
             rows.append({"text": "Zatwierdź konto", "tap": lambda b: self.online_set(
                 p, {"status": "active"}, "Zatwierdzono")})
         if st != "banned":
-            rows.append({"text": "Zbanuj (blokada aplikacji)", "tap": lambda b: self.ask(
-                "Powód bana", lambda r: self.online_set(p, {"status": "banned", "ban_reason": r[:200]},
-                                                        "Zablokowano"))})
+            rows.append({"text": "Zbanuj (blokada aplikacji)", "tap": lambda b: self.online_ban(p)})
         else:
             rows.append({"text": "Odbanuj", "tap": lambda b: self.online_set(
-                p, {"status": "active", "ban_reason": ""}, "Odblokowano")})
+                p, {"status": "active", "ban_reason": "", "ban_until": None}, "Odblokowano")})
+        rows.append({"text": "Edytuj profil (nazwa, opis)", "tap": lambda b: self.online_admin_edit(p)})
+        if p.get("avatar_path"):
+            rows.append({"text": "Usuń zdjęcie profilowe", "tap": lambda b: self.online_remove_avatar(p)})
         rows.append({"text": "Odcisz na czacie" if p.get("muted") else "Wycisz na czacie",
                      "tap": lambda b: self.online_set(p, {"muted": not p.get("muted")},
                                                       "Zmieniono wyciszenie")})
@@ -9107,10 +9152,45 @@ class OnlinePlus:
         else:
             rows.append({"text": "Nadaj uprawnienia admina", "tap": lambda b: self.online_set(
                 p, {"role": "admin"}, "Nadano admina")})
+        rows.append({"text": "Ustaw nowe hasło (zapomniał)", "tap": lambda b: self.ask(
+            f"Nowe hasło dla @{p['username']} (min. 6 znaków)", lambda pw: self.online_do(
+                lambda: self.supa.rpc("admin_set_password", {"target": p["id"], "new_password": pw}),
+                f"Nowe hasło @{p['username']}: {pw}"))})
         rows.append({"text": "Usuń wszystkie jego wiadomości", "tap": lambda b: self.online_do(
             lambda: self.supa.update("messages", f"user_id=eq.{p['id']}&deleted=eq.false",
                                      {"deleted": True}), "Wiadomości usunięte")})
+        rows.append({"text": "Usuń konto na zawsze", "tap": lambda b: self.list_popup(
+            f"Usunąć konto @{p['username']}?", [{"text": "Tak, usuń konto i jego wiadomości",
+                                                 "tap": lambda b2: self.online_do(
+                lambda: self.supa.rpc("admin_delete_user", {"target": p["id"]}),
+                f"Usunięto konto @{p['username']}")}])})
         return rows
+
+    def online_ban(self, p):
+        opts = [("1 godzina", 1), ("1 dzień", 24), ("7 dni", 24 * 7), ("30 dni", 24 * 30),
+                ("Na zawsze", 0)]
+
+        def pick(hours):
+            until = None
+            if hours:
+                until = (datetime.datetime.now(datetime.timezone.utc)
+                         + datetime.timedelta(hours=hours)).isoformat()
+            self.ask(f"Powód bana dla @{p['username']}", lambda r: self.online_set(
+                p, {"status": "banned", "ban_reason": r[:200], "ban_until": until},
+                "Zablokowano" + (f" do {local_time(until)}" if until else " na zawsze")))
+        self.list_popup(f"Ban: @{p['username']} - na jak długo?",
+                        [{"text": t, "tap": lambda b, h=h: pick(h)} for t, h in opts])
+
+    def online_admin_edit(self, p):
+        def save(v, pop):
+            pop.dismiss()
+            self.online_set(p, {"display_name": v["display"][:40], "bio": v["bio"][:300]},
+                            "Profil zmieniony")
+        self.form_popup(f"Edytuj @{p['username']}",
+                        [("display", "Wyświetlana nazwa", p.get("display_name", "")),
+                         ("bio", "Opis", p.get("bio", ""))],
+                        [("Zapisz", save), ("Anuluj", lambda v, pop: pop.dismiss())],
+                        info="Nazwy konta (loginu) nie da się zmienić.")
 
     def online_set(self, p, values, ok_msg):
         self.online_do(lambda: self.supa.update("profiles", f"id=eq.{p['id']}", values), ok_msg)
@@ -9150,6 +9230,231 @@ class OnlinePlus:
                                                   "tap": lambda b: self.online_do(
             lambda: self.supa.update("messages", "deleted=eq.false", {"deleted": True}),
             "Czat wyczyszczony")}])
+
+
+    # ------------------------------------------------------------ zdjęcia profilowe
+    def online_avatar(self, path, widget):
+        """Zdjęcie profilowe z serwera (pamięć podręczna wg ścieżki - nowa ścieżka = nowe zdjęcie)."""
+        if not path or not self.online_ready():
+            return
+        folder = Path(self.user_data_dir) / "awatary"
+        f = folder / (re.sub(r"[^A-Za-z0-9_.-]", "_", path))
+        if f.exists():
+            widget.source = str(f)
+            return
+        pend = self.__dict__.setdefault("_av_pending", {})
+        if path in pend:
+            pend[path].append(widget)
+            return
+        pend[path] = [widget]
+
+        def work():
+            url = self.supa.signed_urls([path], 3600, bucket="avatars").get(path)
+            if not url:
+                raise RuntimeError("brak zdjęcia")
+            folder.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_suffix(".part")
+            tmp.write_bytes(http_get(url))
+            tmp.replace(f)
+            return str(f)
+
+        def done(res):
+            for w in pend.pop(path, []):
+                if isinstance(res, str):
+                    w.source = res
+        self.run_bg(work, done)
+
+    def online_big_avatar(self, p):
+        if not p.get("avatar_path"):
+            return
+        im = TapImage(fit_mode="contain")
+        pop = RoundPopup(title=p.get("display_name") or p.get("username") or "", content=im,
+                         size_hint=(0.92, 0.6))
+        im.bind(on_release=lambda *_: pop.dismiss())
+        self.online_avatar(p["avatar_path"], im)
+        pop.open()
+
+    def pick_file(self, mime, cb):
+        """Systemowe okno wyboru pliku (galeria / menedżer plików). cb(ścieżka, nazwa) albo cb(None, błąd)."""
+        try:
+            from android import activity
+            from jnius import autoclass, cast
+        except ImportError:
+            self.ask("Ścieżka do pliku", lambda t: cb(t, Path(t).name) if Path(t).exists()
+                     else cb(None, "Nie ma takiego pliku"))
+            return
+        Intent = autoclass("android.content.Intent")
+        String = autoclass("java.lang.String")
+        Files = autoclass("pl.leox.media.LeoxFiles")
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        req = 4711
+
+        def on_result(request, result, data):
+            if request != req:
+                return
+            activity.unbind(on_activity_result=on_result)
+            if result != -1 or data is None or data.getData() is None:
+                Clock.schedule_once(lambda dt: cb(None, "Anulowano"))
+                return
+            uri = data.getData()
+
+            def copy():
+                try:
+                    name = Files.displayName(act, uri) or "plik"
+                    dest = Path(self.user_data_dir) / "wybrane"
+                    dest.mkdir(parents=True, exist_ok=True)
+                    out = dest / (uuid.uuid4().hex + Path(name).suffix.lower())
+                    n = Files.copyUri(act, uri, str(out))
+                    if n < 0:
+                        Clock.schedule_once(lambda dt: cb(None, "Nie udało się odczytać pliku"))
+                    else:
+                        Clock.schedule_once(lambda dt: cb(str(out), name))
+                finally:
+                    try:
+                        from jnius import detach
+                        detach()
+                    except Exception:
+                        pass
+            Clock.schedule_once(lambda dt: self.set_status("Wczytywanie pliku..."))
+            threading.Thread(target=copy, daemon=True).start()
+        activity.bind(on_activity_result=on_result)
+        it = Intent(Intent.ACTION_GET_CONTENT)
+        it.setType(mime)
+        it.addCategory(Intent.CATEGORY_OPENABLE)
+        act.startActivityForResult(
+            Intent.createChooser(it, cast("java.lang.CharSequence", String("Wybierz plik"))), req)
+
+    def online_set_avatar(self):
+        def picked(path, name):
+            if not path:
+                self.set_status(name)
+                return
+            self.set_status("Wysyłanie zdjęcia...")
+            old = (self.online_me or {}).get("avatar_path", "")
+
+            def work():
+                jpg = str(Path(path).with_suffix(".avatar.jpg"))
+                try:
+                    from jnius import autoclass
+                    ok = autoclass("pl.leox.media.LeoxFiles").squareJpeg(path, jpg, 512)
+                except Exception:
+                    ok = False
+                src, mime = (jpg, "image/jpeg") if ok else (path, {
+                    ".png": "image/png", ".webp": "image/webp"}.get(Path(path).suffix.lower(), "image/jpeg"))
+                if Path(src).stat().st_size > 2 * 1024 * 1024:
+                    raise RuntimeError("Zdjęcie większe niż 2 MB")
+                obj = f"{self.supa.uid}/{uuid.uuid4().hex}{Path(src).suffix or '.jpg'}"
+                self.supa.upload(obj, src, mime, bucket="avatars")
+                self.supa.update("profiles", f"id=eq.{self.supa.uid}", {"avatar_path": obj})
+                if old:
+                    try:
+                        self.supa.remove_object(old, bucket="avatars")
+                    except Exception:
+                        pass
+                for x in (path, jpg):
+                    try:
+                        os.remove(x)
+                    except OSError:
+                        pass
+                return True
+            self.online_do(work, "Zdjęcie profilowe ustawione", self.online_check)
+        self.pick_file("image/*", picked)
+
+    def online_remove_avatar(self, p):
+        path = p.get("avatar_path", "")
+        if not path:
+            return
+
+        def work():
+            self.supa.update("profiles", f"id=eq.{p['id']}", {"avatar_path": ""})
+            try:
+                self.supa.remove_object(path, bucket="avatars")
+            except Exception:
+                pass
+            return True
+        self.online_do(work, "Zdjęcie usunięte", self.online_check)
+
+    # ------------------------------------------------------------ online, dziennik, pliki
+    def online_who(self):
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(minutes=5)).isoformat()
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.set_status(pl_error(res))
+                return
+            rows = [{"text": f"{p.get('display_name') or p['username']}  (@{p['username']})",
+                     "tap": lambda b, p=p: self.online_profile_popup(p),
+                     "avatar": p.get("avatar_path", "")} for p in res]
+            self.list_popup(f"Online: {len(rows)}", rows or [{"text": "Nikogo", "tap": lambda b: None}])
+        self.run_bg(lambda: self.supa.select(
+            "profiles", "select=*&last_seen=gte." + urllib.parse.quote(since)
+            + "&order=last_seen.desc&limit=200"), done)
+
+    def online_admin_log(self):
+        def done(res):
+            if isinstance(res, Exception):
+                self.set_status(pl_error(res))
+                return
+            rows = []
+            for e in res:
+                who = ((e.get("admin") or {}).get("username")) or "?"
+                rows.append({"text": f"{local_time(e['created_at'])}  @{who} -> @{e.get('target_name') or '?'}\n"
+                                     f"{e['action']}: {e.get('details') or ''}",
+                             "tap": lambda b: None, "h": 90})
+            self.list_popup("Dziennik admina", rows or [{"text": "Pusto", "tap": lambda b: None}])
+        self.run_bg(lambda: self.supa.select(
+            "admin_log", "select=*,admin:profiles!admin_log_admin_id_fkey(username)"
+            "&order=created_at.desc&limit=200"), done)
+
+    def online_upload_file(self):
+        def picked(path, name):
+            if not path:
+                self.set_status(name)
+                return
+            title, artist = split_name(Path(name).stem)
+            dur = 0.0
+            if mutagen:
+                try:
+                    f = mutagen.File(path, easy=True)
+                    if f is not None:
+                        title = (f.get("title") or [title])[0]
+                        artist = (f.get("artist") or [artist])[0]
+                        dur = float(getattr(f.info, "length", 0) or 0)
+                except Exception:
+                    pass
+            ext = Path(name).suffix.lower() or ".mp3"
+            tmp = Path(path)
+            if tmp.suffix.lower() != ext:
+                tmp = tmp.rename(tmp.with_suffix(ext))
+            self.online_upload((str(tmp), title, artist, "", dur), cleanup=True)
+        self.pick_file("audio/*", picked)
+
+
+def ban_expired(p):
+    if not p or p.get("status") != "banned" or not p.get("ban_until"):
+        return False
+    try:
+        until = datetime.datetime.fromisoformat(str(p["ban_until"]).replace("Z", "+00:00"))
+        return until < datetime.datetime.now(datetime.timezone.utc)
+    except ValueError:
+        return False
+
+
+def is_online(p):
+    try:
+        t = datetime.datetime.fromisoformat(str(p.get("last_seen") or "").replace("Z", "+00:00"))
+        return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() < 300
+    except ValueError:
+        return False
+
+
+def local_time(iso):
+    try:
+        t = datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        return t.astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return str(iso)[:16].replace("T", " ")
 
 
 for _name, _fn in list(vars(OnlinePlus).items()):

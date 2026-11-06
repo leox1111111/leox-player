@@ -1,6 +1,7 @@
 -- Leox Player - baza w Supabase (profile, czat, wspólna muzyka, bany, przerwa techniczna).
 -- Uruchom raz: Supabase -> SQL Editor -> New query -> wklej całość -> Run.
 -- Można uruchomić ponownie (np. po aktualizacji) - nie kasuje danych.
+-- Po tym pliku uruchom supabase/v2.sql (zdjęcia profilowe, bany czasowe, dziennik admina).
 
 -- ---------------------------------------------------------------- tabele
 create table if not exists public.profiles (
