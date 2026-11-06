@@ -2860,6 +2860,7 @@ class MuzykaApp(App):
     def build(self):
         self.title = "Leox Player"
         threading.Thread(target=patch_ytdlp, daemon=True).start()
+        Clock.schedule_once(lambda dt: self.online_start(), 1.5)
         request_perms()
         Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
         setup_font(Path(self.user_data_dir) / "fonts")
@@ -4960,6 +4961,8 @@ class MuzykaApp(App):
         alarm = (datetime.datetime.fromtimestamp(self.alarm_at).strftime("%H:%M")
                  if self.alarm_at else "wył.")
         rows = [
+            ("Społeczność: czat, wspólna muzyka, profil" + (" (ADMIN)" if self.is_admin() else ""),
+             lambda b: self.show_online()),
             ("Szukaj wszędzie (biblioteka, YouTube, radio)", lambda b: self.show_global_search()),
             (f"Wyślij na komputer / telewizor{' (' + self.cast.name + ')' if self.cast else ''}",
              lambda b: self.show_cast_menu()),
@@ -8291,6 +8294,863 @@ class TilesPlus:
 for _name, _fn in list(vars(TilesPlus).items()):
     if not _name.startswith("__"):
         setattr(MuzykaApp, _name, _fn)
+
+
+# =====================================================================
+#  LEOX PLAYER - SPOŁECZNOŚĆ (Supabase)
+#  Konta i profile, czat publiczny, wspólna muzyka na serwerze,
+#  panel admina: akceptacja kont, bany, wyciszanie, przerwa techniczna,
+#  ogłoszenia, statystyki, dodawanie i usuwanie utworów.
+#  Konfiguracja: wpisz adres projektu i klucz "anon public" poniżej.
+#  Baza: plik supabase/schema.sql (uruchom raz w SQL Editor).
+# =====================================================================
+import uuid
+import urllib.error
+
+SUPABASE_URL = ""          # np. https://abcdefgh.supabase.co
+SUPABASE_KEY = ""          # Project Settings -> API -> anon public
+LOGIN_DOMAIN = "leox.app"  # konto = nazwa@leox.app (bez prawdziwej skrzynki)
+
+AUDIO_MIME = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac",
+              ".ogg": "audio/ogg", ".opus": "audio/opus", ".flac": "audio/flac",
+              ".wav": "audio/wav", ".webm": "audio/webm"}
+
+
+class SupaError(Exception):
+    def __init__(self, msg, code=0):
+        super().__init__(msg)
+        self.code = code
+
+
+def supa_message(raw):
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return raw[:200] if raw else "błąd serwera"
+    if isinstance(d, dict):
+        for k in ("msg", "message", "error_description", "error"):
+            if d.get(k):
+                return str(d[k])
+    return str(d)[:200]
+
+
+PL_ERRORS = {
+    "invalid login credentials": "Zła nazwa albo hasło",
+    "user already registered": "Taka nazwa jest już zajęta",
+    "password should be at least": "Hasło musi mieć co najmniej 6 znaków",
+    "duplicate key": "Taka nazwa jest już zajęta",
+    "row-level security": "Brak uprawnień (konto nieaktywne?)",
+    "jwt expired": "Sesja wygasła - zaloguj się ponownie",
+}
+
+
+def pl_error(e):
+    s = str(e)
+    low = s.lower()
+    for k, v in PL_ERRORS.items():
+        if k in low:
+            return v
+    if isinstance(e, urllib.error.URLError) or "urlopen" in low or "timed out" in low:
+        return "Brak połączenia z serwerem"
+    return s
+
+
+class Supa:
+    """Mały klient Supabase (logowanie, baza REST, pliki) na samym urllib."""
+
+    def __init__(self, url, key, load, save):
+        self.url, self.key = url.rstrip("/"), key
+        self._save_fn = save
+        try:
+            self.session = json.loads(load() or "{}")
+        except ValueError:
+            self.session = {}
+        self.lock = threading.Lock()
+
+    # --- sesja
+    @property
+    def uid(self):
+        return (self.session.get("user") or {}).get("id")
+
+    def logged_in(self):
+        return bool(self.session.get("refresh_token"))
+
+    def _store(self, s):
+        if s.get("expires_in"):
+            s["expires_at"] = time.time() + int(s["expires_in"])
+        self.session = s
+        self._save_fn(json.dumps(s))
+
+    def clear(self):
+        self.session = {}
+        self._save_fn("")
+
+    def _ensure_fresh(self):
+        if self.logged_in() and self.session.get("expires_at", 0) - 60 < time.time():
+            self.refresh()
+
+    def refresh(self):
+        with self.lock:
+            if self.session.get("expires_at", 0) - 60 > time.time():
+                return
+            s = self._raw("POST", "/auth/v1/token?grant_type=refresh_token",
+                          {"refresh_token": self.session.get("refresh_token")}, token=self.key)
+            self._store(s)
+
+    # --- zapytania
+    def _raw(self, method, path, body=None, token=None, headers=None, data=None, timeout=25):
+        h = {"apikey": self.key, "Authorization": f"Bearer {token or self.key}"}
+        if data is None and body is not None:
+            data = json.dumps(body).encode("utf-8")
+            h["Content-Type"] = "application/json"
+        h.update(headers or {})
+        req = urllib.request.Request(self.url + path, data=data, method=method, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                txt = r.read()
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            raise SupaError(supa_message(raw), e.code)
+        return json.loads(txt) if txt else None
+
+    def req(self, method, path, body=None, headers=None, data=None, timeout=25):
+        self._ensure_fresh()
+        try:
+            return self._raw(method, path, body, self.session.get("access_token"), headers, data,
+                             timeout)
+        except SupaError as e:
+            if e.code == 401 and self.logged_in():
+                self.session["expires_at"] = 0
+                self.refresh()
+                return self._raw(method, path, body, self.session.get("access_token"), headers,
+                                 data, timeout)
+            raise
+
+    # --- konto
+    def signup(self, username, password, display):
+        s = self._raw("POST", "/auth/v1/signup", {
+            "email": f"{username}@{LOGIN_DOMAIN}", "password": password,
+            "data": {"username": username, "display_name": display or username}})
+        if not s or not s.get("access_token"):
+            raise SupaError("Serwer wymaga potwierdzenia e-mail. Admin musi wyłączyć "
+                            "\"Confirm email\" w Supabase (Authentication -> Sign In / Providers -> Email).")
+        self._store(s)
+
+    def login(self, username, password):
+        s = self._raw("POST", "/auth/v1/token?grant_type=password",
+                      {"email": f"{username}@{LOGIN_DOMAIN}", "password": password})
+        self._store(s)
+
+    def change_password(self, password):
+        self.req("PUT", "/auth/v1/user", {"password": password})
+
+    def logout(self):
+        try:
+            self.req("POST", "/auth/v1/logout", timeout=8)
+        except Exception:
+            pass
+        self.clear()
+
+    # --- baza
+    def select(self, table, query):
+        return self.req("GET", f"/rest/v1/{table}?{query}") or []
+
+    def insert(self, table, row):
+        return self.req("POST", f"/rest/v1/{table}", row,
+                        headers={"Prefer": "return=representation"})
+
+    def update(self, table, filt, values):
+        res = self.req("PATCH", f"/rest/v1/{table}?{filt}", values,
+                       headers={"Prefer": "return=representation"})
+        if not res:
+            raise SupaError("Nic nie zmieniono (brak uprawnień?)")
+        return res
+
+    def delete(self, table, filt):
+        return self.req("DELETE", f"/rest/v1/{table}?{filt}")
+
+    def rpc(self, fn, args=None):
+        return self.req("POST", f"/rest/v1/rpc/{fn}", args or {})
+
+    # --- pliki
+    def upload(self, obj, path, mime):
+        data = Path(path).read_bytes()
+        self.req("POST", f"/storage/v1/object/music/{urllib.parse.quote(obj)}", data=data,
+                 headers={"Content-Type": mime, "x-upsert": "false"}, timeout=600)
+        return len(data)
+
+    def remove_object(self, obj):
+        self.req("DELETE", "/storage/v1/object/music", {"prefixes": [obj]})
+
+    def signed_urls(self, objs, expires=12 * 3600):
+        if not objs:
+            return {}
+        res = self.req("POST", "/storage/v1/object/sign/music",
+                       {"expiresIn": expires, "paths": list(objs)}) or []
+        out = {}
+        for r in res:
+            if r.get("signedURL"):
+                out[r.get("path")] = self.url + "/storage/v1" + r["signedURL"]
+        return out
+
+
+class ChatLine(ButtonBehavior, Label):
+    pass
+
+
+class OnlinePlus:
+    # ------------------------------------------------------------ start i blokada
+    def online_ready(self):
+        return bool(SUPABASE_URL and SUPABASE_KEY)
+
+    def online_start(self, *_):
+        self.online_lock_view = None
+        self.online_me = None
+        self.online_settings = {}
+        if not self.online_ready():
+            return
+        self.supa = Supa(SUPABASE_URL, SUPABASE_KEY,
+                         lambda: self.lib.get_setting("supa_sesja", ""),
+                         lambda v: self.lib.set_setting("supa_sesja", v))
+        saved = self.lib.get_setting("blokada", "")
+        if saved:
+            self.online_lock(saved)
+        if not self.supa.logged_in():
+            self.online_login()
+        else:
+            self.online_check()
+        Clock.schedule_interval(self.online_check, 60)
+
+    def online_check(self, *_):
+        if not self.online_ready() or not self.supa.logged_in():
+            return
+        supa = self.supa
+
+        def work():
+            me = supa.select("profiles", f"id=eq.{supa.uid}&select=*")
+            st = supa.select("app_settings", "id=eq.1&select=*")
+            try:
+                supa.rpc("touch")
+            except Exception:
+                pass
+            return (me[0] if me else None), (st[0] if st else {})
+
+        def done(res):
+            if isinstance(res, Exception):
+                if isinstance(res, SupaError) and res.code in (400, 401, 403):
+                    self.supa.clear()
+                    self.online_login("Sesja wygasła - zaloguj się ponownie")
+                return                          # brak sieci - zostaje ostatni znany stan
+            me, st = res
+            self.online_me, self.online_settings = me, st
+            if me is None:
+                self.online_lock("Konto nie istnieje albo zostało usunięte.", relogin=True)
+            elif me["status"] == "banned":
+                msg = "Zostałeś zablokowany przez administratora."
+                if me.get("ban_reason"):
+                    msg += f"\nPowód: {me['ban_reason']}"
+                self.lib.set_setting("blokada", msg)      # zostaje po wylogowaniu
+                self.online_lock(msg, relogin=True)
+            elif st.get("maintenance") and me.get("role") != "admin":
+                self.online_lock(st.get("maintenance_msg") or "Przerwa techniczna.")
+            elif me["status"] == "pending":
+                if self.lib.get_setting("blokada", ""):
+                    self.online_lock("To urządzenie było zablokowane. Nowe konto musi "
+                                     "zatwierdzić administrator.", relogin=True)
+                else:
+                    self.online_unlock()
+                    self.set_status("Konto czeka na akceptację administratora")
+            else:
+                self.lib.set_setting("blokada", "")
+                self.online_unlock()
+        self.run_bg(work, done)
+
+    def online_lock(self, msg, relogin=False):
+        try:
+            if self.apk:
+                self.player.cmd(cmd="quit")
+            else:
+                self.player.stop()
+        except Exception:
+            pass
+        if self.online_lock_view is not None:
+            self.online_lock_view.msg.text = msg
+            return
+        mv = ModalView(auto_dismiss=False, size_hint=(1, 1), background_color=(0, 0, 0, 0.96))
+        box = BoxLayout(orientation="vertical", padding=dp(24), spacing=dp(14))
+        box.add_widget(Label(text="Leox Player", font_size="30sp", color=ACCENT, bold=True,
+                             size_hint_y=None, height=dp(60)))
+        lbl = Label(text=msg, color=TEXT, font_size="17sp", halign="center", valign="middle")
+        lbl.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+        box.add_widget(lbl)
+        b1 = RoundButton(text="Sprawdź ponownie", size_hint_y=None, height=dp(56),
+                         bg=list(ACCENT_DIM))
+        b1.bind(on_release=lambda *_: self.online_check())
+        box.add_widget(b1)
+        if relogin:
+            b2 = RoundButton(text="Zaloguj na inne konto", size_hint_y=None, height=dp(56),
+                             bg=list(CARD_HI))
+            b2.bind(on_release=lambda *_: self.online_logout())
+            box.add_widget(b2)
+        mv.add_widget(box)
+        mv.msg = lbl
+        self.online_lock_view = mv
+        mv.open()
+
+    def online_unlock(self):
+        if self.online_lock_view is not None:
+            self.online_lock_view.dismiss()
+            self.online_lock_view = None
+
+    # ------------------------------------------------------------ logowanie
+    def online_login(self, info=""):
+        mv = getattr(self, "online_login_view", None)
+        if mv is not None:
+            return
+        mv = ModalView(auto_dismiss=False, size_hint=(1, 1), background_color=(0, 0, 0, 0.97))
+        self.online_login_view = mv
+        box = BoxLayout(orientation="vertical", padding=dp(22), spacing=dp(10))
+        box.add_widget(Label(text="Leox Player", font_size="30sp", color=ACCENT, bold=True,
+                             size_hint_y=None, height=dp(56)))
+        msg = Label(text=info or "Zaloguj się albo załóż konto.", color=MUTED, font_size="14sp",
+                    size_hint_y=None, height=dp(52), halign="center", valign="middle")
+        msg.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+        box.add_widget(msg)
+        user = RoundInput(hint_text="Nazwa (a-z, 0-9, _ ; 3-20 znaków)", multiline=False,
+                          size_hint_y=None, height=dp(54))
+        pw = RoundInput(hint_text="Hasło (min. 6 znaków)", multiline=False, password=True,
+                        size_hint_y=None, height=dp(54))
+        disp = RoundInput(hint_text="Wyświetlana nazwa (tylko przy rejestracji)", multiline=False,
+                          size_hint_y=None, height=dp(54))
+        for w in (user, pw, disp):
+            box.add_widget(w)
+        b_login = RoundButton(text="Zaloguj", size_hint_y=None, height=dp(56), bg=list(ACCENT_DIM))
+        b_reg = RoundButton(text="Załóż konto", size_hint_y=None, height=dp(56), bg=list(CARD_HI))
+        box.add_widget(b_login)
+        box.add_widget(b_reg)
+        box.add_widget(Widget())
+
+        def go(register):
+            u = user.text.strip().lower()
+            p = pw.text
+            if not re.fullmatch(r"[a-z0-9_]{3,20}", u):
+                msg.text = "Nazwa: 3-20 znaków, tylko małe litery, cyfry i _"
+                return
+            if len(p) < 6:
+                msg.text = "Hasło musi mieć co najmniej 6 znaków"
+                return
+            msg.text = "Łączenie..."
+            b_login.disabled = b_reg.disabled = True
+
+            def work():
+                if register:
+                    self.supa.signup(u, p, disp.text.strip()[:40])
+                else:
+                    self.supa.login(u, p)
+                return True
+
+            def done(res):
+                b_login.disabled = b_reg.disabled = False
+                if isinstance(res, Exception):
+                    msg.text = pl_error(res)
+                    return
+                mv.dismiss()
+                self.online_login_view = None
+                if register:
+                    self.set_status("Konto założone - czeka na akceptację administratora")
+                self.online_check()
+            self.run_bg(work, done)
+        b_login.bind(on_release=lambda *_: go(False))
+        b_reg.bind(on_release=lambda *_: go(True))
+        mv.add_widget(box)
+        mv.open()
+
+    def online_logout(self):
+        self.online_unlock()
+
+        def work():
+            self.supa.logout()
+            return True
+        self.run_bg(work, lambda res: self.online_login("Wylogowano."))
+
+    # ------------------------------------------------------------ menu
+    def is_admin(self):
+        me = getattr(self, "online_me", None)
+        return bool(me and me.get("role") == "admin" and me.get("status") == "active")
+
+    def is_active_user(self):
+        me = getattr(self, "online_me", None)
+        return bool(me and me.get("status") == "active")
+
+    def show_online(self):
+        if not self.online_ready():
+            self.list_popup("Społeczność", [{
+                "text": "Nie skonfigurowano serwera.\nWpisz SUPABASE_URL i SUPABASE_KEY w kodzie.",
+                "tap": lambda b: None, "h": 90}])
+            return
+        if not self.supa.logged_in():
+            self.online_login()
+            return
+        me = self.online_me or {}
+        name = me.get("display_name") or me.get("username") or "?"
+        st = {"pending": "czeka na akceptację", "active": "aktywne",
+              "banned": "zablokowane"}.get(me.get("status"), "?")
+        rows = [{"text": f"{name}  (@{me.get('username', '?')})\nKonto: {st}"
+                         f"{'  -  ADMIN' if self.is_admin() else ''}",
+                 "tap": lambda b: self.online_edit_profile(), "h": 80}]
+        if self.is_active_user():
+            rows += [{"text": "Czat publiczny", "tap": lambda b: self.online_chat()},
+                     {"text": "Wspólna muzyka", "tap": lambda b: self.online_music()},
+                     {"text": "Użytkownicy", "tap": lambda b: self.online_users("active")}]
+        rows += [{"text": "Mój profil", "tap": lambda b: self.online_edit_profile()},
+                 {"text": "Zmień hasło", "tap": lambda b: self.online_password()}]
+        if self.is_admin():
+            rows.append({"text": "PANEL ADMINA", "tap": lambda b: self.online_admin(),
+                         "bg": list(ACCENT_DIM)})
+        rows.append({"text": "Wyloguj", "tap": lambda b: self.online_logout()})
+        self.list_popup("Społeczność", rows)
+        self.online_check()
+
+    # ------------------------------------------------------------ profil
+    def online_edit_profile(self):
+        me = self.online_me or {}
+
+        def save(v, pop):
+            pop.dismiss()
+            vals = {"display_name": v["display"][:40], "bio": v["bio"][:300]}
+            self.run_bg(lambda: self.supa.update("profiles", f"id=eq.{self.supa.uid}", vals),
+                        lambda res: self.set_status(pl_error(res) if isinstance(res, Exception)
+                                                    else "Profil zapisany") or self.online_check())
+        self.form_popup("Mój profil", [("display", "Wyświetlana nazwa", me.get("display_name", "")),
+                                       ("bio", "O mnie", me.get("bio", ""))],
+                        [("Zapisz", save), ("Anuluj", lambda v, pop: pop.dismiss())],
+                        info=f"Konto: @{me.get('username', '?')}")
+
+    def online_password(self):
+        def save(v, pop):
+            if len(v["pw"]) < 6 or v["pw"] != v["pw2"]:
+                self.set_status("Hasła różne albo krótsze niż 6 znaków")
+                return
+            pop.dismiss()
+            self.run_bg(lambda: self.supa.change_password(v["pw"]),
+                        lambda res: self.set_status(pl_error(res) if isinstance(res, Exception)
+                                                    else "Hasło zmienione"))
+        self.form_popup("Zmień hasło", [("pw", "Nowe hasło", ""), ("pw2", "Powtórz hasło", "")],
+                        [("Zapisz", save), ("Anuluj", lambda v, pop: pop.dismiss())])
+
+    def online_profile_popup(self, p):
+        joined = (p.get("created_at") or "")[:10]
+        tags = []
+        if p.get("role") == "admin":
+            tags.append("admin")
+        if p.get("muted"):
+            tags.append("wyciszony")
+        if p.get("status") != "active":
+            tags.append({"pending": "oczekuje", "banned": "zablokowany"}.get(p.get("status"), ""))
+        rows = [{"text": f"{p.get('display_name') or p.get('username')}  (@{p.get('username')})"
+                         f"{'  [' + ', '.join(tags) + ']' if tags else ''}\nOd: {joined}",
+                 "tap": lambda b: None, "h": 80}]
+        if p.get("bio"):
+            rows.append({"text": p["bio"], "tap": lambda b: None, "h": 100})
+        if self.is_admin() and p.get("id") != self.supa.uid:
+            rows += self.online_admin_actions(p)
+        self.list_popup("Profil", rows)
+
+    # ------------------------------------------------------------ czat
+    def online_chat(self):
+        supa = self.supa
+        st = {"last": 0, "open": True, "busy": False, "ev": None, "profiles": {}}
+        box = BoxLayout(orientation="vertical", spacing=dp(6))
+        ann = Label(text="", color=ACCENT, font_size="14sp", size_hint_y=None, height=0,
+                    halign="left", valign="middle", markup=True)
+        ann.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+        box.add_widget(ann)
+        grid = GridLayout(cols=1, size_hint_y=None, spacing=dp(4), padding=(dp(2), dp(2)))
+        grid.bind(minimum_height=grid.setter("height"))
+        sv = ScrollView(bar_color=ACCENT_DIM)
+        sv.add_widget(grid)
+        box.add_widget(sv)
+        bar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(4))
+        ti = RoundInput(hint_text="Napisz wiadomość...", multiline=False)
+        send = RoundButton(text="Wyślij", size_hint_x=None, width=dp(90), bg=list(ACCENT_DIM))
+        close = RoundButton(text="X", size_hint_x=None, width=dp(56), bg=list(CARD_HI))
+        bar.add_widget(ti)
+        bar.add_widget(send)
+        bar.add_widget(close)
+        box.add_widget(bar)
+        pop = RoundPopup(title="Czat publiczny", content=box, size_hint=(1, 1))
+
+        def add_line(m):
+            p = m.get("profiles") or {}
+            st["profiles"][m["user_id"]] = dict(p, id=m["user_id"])
+            name = escape_markup(p.get("display_name") or p.get("username") or "?")
+            when = (m.get("created_at") or "")[11:16]
+            badge = " [color=#e08f52](admin)[/color]" if p.get("role") == "admin" else ""
+            text = "[i]wiadomość usunięta[/i]" if m.get("deleted") else escape_markup(m["content"])
+            line = ChatLine(text=f"[b]{name}[/b]{badge}  [size=11sp]{when}[/size]\n{text}",
+                            markup=True, color=TEXT if not m.get("deleted") else MUTED,
+                            font_size="15sp", halign="left", valign="top", size_hint_y=None)
+            line.bind(width=lambda w, v: setattr(w, "text_size", (v - dp(8), None)),
+                      texture_size=lambda w, v: setattr(w, "height", v[1] + dp(8)))
+            line.bind(on_release=lambda *_: self.online_msg_menu(m, st["profiles"][m["user_id"]],
+                                                                 lambda: refresh(True)))
+            grid.add_widget(line)
+
+        def refresh(full=False):
+            if st["busy"] or not st["open"]:
+                return
+            st["busy"] = True
+            if full:
+                st["last"] = 0
+            last = st["last"]
+
+            def work():
+                sel = "select=id,content,created_at,deleted,user_id," \
+                      "profiles(username,display_name,role)"
+                if last:
+                    msgs = supa.select("messages", f"{sel}&id=gt.{last}&order=id.asc&limit=100")
+                else:
+                    msgs = list(reversed(supa.select("messages", f"{sel}&order=id.desc&limit=60")))
+                sets = supa.select("app_settings", "id=eq.1&select=announcement")
+                return msgs, (sets[0] if sets else {})
+
+            def done(res):
+                st["busy"] = False
+                if isinstance(res, Exception):
+                    pop.title = f"Czat publiczny - {pl_error(res)}"[:60]
+                    return
+                pop.title = "Czat publiczny"
+                msgs, sets = res
+                if not last:
+                    grid.clear_widgets()
+                at_bottom = sv.scroll_y < 0.05 or not last
+                for m in msgs:
+                    add_line(m)
+                    st["last"] = max(st["last"], m["id"])
+                a = (sets.get("announcement") or "").strip()
+                ann.text = f"[b]Ogłoszenie:[/b] {escape_markup(a)}" if a else ""
+                ann.height = dp(48) if a else 0
+                if msgs and at_bottom:
+                    Clock.schedule_once(lambda dt: setattr(sv, "scroll_y", 0), 0.05)
+            self.run_bg(work, done)
+
+        def do_send(*_):
+            txt = ti.text.strip()
+            if not txt:
+                return
+            if (self.online_me or {}).get("muted"):
+                self.set_status("Jesteś wyciszony na czacie")
+                return
+            ti.text = ""
+            send.disabled = True
+
+            def done(res):
+                send.disabled = False
+                if isinstance(res, Exception):
+                    ti.text = txt
+                    pop.title = pl_error(res)[:60]
+                    return
+                refresh()
+            self.run_bg(lambda: supa.insert("messages", {"user_id": supa.uid, "content": txt[:500]}),
+                        done)
+
+        def closed(*_):
+            st["open"] = False
+            if st["ev"]:
+                st["ev"].cancel()
+        send.bind(on_release=do_send)
+        ti.bind(on_text_validate=do_send)
+        close.bind(on_release=lambda *_: pop.dismiss())
+        pop.bind(on_dismiss=closed)
+        st["ev"] = Clock.schedule_interval(lambda dt: refresh(), 3)
+        pop.open()
+        refresh(True)
+
+    def online_msg_menu(self, m, p, after):
+        rows = [{"text": f"Profil: {p.get('display_name') or p.get('username')}",
+                 "tap": lambda b: self.online_open_profile(m["user_id"])}]
+        if self.is_admin():
+            if not m.get("deleted"):
+                rows.append({"text": "Usuń wiadomość", "tap": lambda b: self.online_do(
+                    lambda: self.supa.update("messages", f"id=eq.{m['id']}", {"deleted": True}),
+                    "Wiadomość usunięta", after)})
+            else:
+                rows.append({"text": "Przywróć wiadomość", "tap": lambda b: self.online_do(
+                    lambda: self.supa.update("messages", f"id=eq.{m['id']}", {"deleted": False}),
+                    "Przywrócono", after)})
+        self.list_popup("Wiadomość", rows)
+
+    def online_open_profile(self, uid):
+        self.run_bg(lambda: self.supa.select("profiles", f"id=eq.{uid}&select=*"),
+                    lambda res: self.set_status(pl_error(res)) if isinstance(res, Exception)
+                    else (res and self.online_profile_popup(res[0])))
+
+    def online_do(self, work, ok_msg, after=None):
+        """Akcja na serwerze w tle + komunikat."""
+        def done(res):
+            if isinstance(res, Exception):
+                self.set_status(pl_error(res))
+                return
+            self.set_status(ok_msg)
+            if after:
+                after()
+        self.run_bg(work, done)
+
+    # ------------------------------------------------------------ wspólna muzyka
+    def online_music(self):
+        supa = self.supa
+        admin = self.is_admin()
+        cache = {}
+
+        def fetch(q):
+            flt = "select=*&order=created_at.desc&limit=200"
+            if q:
+                qq = urllib.parse.quote(f"*{q}*")
+                flt += f"&or=(title.ilike.{qq},artist.ilike.{qq})"
+            rows = supa.select("tracks", flt)
+            cache["rows"] = rows
+            out = []
+            for i, t in enumerate(rows):
+                r = {"text": f"{t['artist'] or '?'} - {t['title']}\n{fmt(t['duration'])}",
+                     "tap": lambda b, i=i: self.online_play_shared(cache["rows"], i),
+                     "sides": [("Pobierz", lambda b, t=t: self.online_download_shared(t))]}
+                if admin:
+                    r["sides"].append(("Usuń", lambda b, t=t: self.online_delete_track(t)))
+                out.append(r)
+            return out
+        footer = [("Graj wszystko", lambda b: cache.get("rows") and
+                   self.online_play_shared(cache["rows"], 0))]
+        if admin:
+            footer.append(("Dodaj z telefonu", lambda b: self.online_pick_upload()))
+        self.live_search_popup("Wspólna muzyka", "Szukaj na serwerze", fetch, footer,
+                               empty_msg="Brak utworów na serwerze")
+
+    def online_play_shared(self, rows, i):
+        if not rows:
+            return
+        self.set_status("Wczytywanie wspólnej muzyki...")
+
+        def work():
+            return self.supa.signed_urls([t["object_path"] for t in rows])
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.set_status(pl_error(res))
+                return
+            q = [(res[t["object_path"]], t["title"], t["artist"] or "", "Wspólna muzyka",
+                  float(t["duration"] or 0)) for t in rows if t["object_path"] in res]
+            if not q:
+                self.set_status("Nie udało się pobrać linków do utworów")
+                return
+            self.queue, self.qi = q, min(i, len(q) - 1)
+            self.play_current()
+        self.run_bg(work, done)
+
+    def online_download_shared(self, t):
+        def work():
+            return self.supa.signed_urls([t["object_path"]])
+
+        def done(res):
+            if isinstance(res, Exception) or not res:
+                self.set_status(pl_error(res) if isinstance(res, Exception) else "Brak pliku")
+                return
+            ext = Path(t["object_path"]).suffix or ".mp3"
+            name = safe_name(f"{t['artist'] or '?'} - {t['title']}") + ext
+            self.download(res[t["object_path"]], kind="file", title=t["title"],
+                          dest=str(self.dl_dir / name))
+            self.set_status(f"Pobieranie: {t['title']}")
+        self.run_bg(work, done)
+
+    def online_delete_track(self, t):
+        def go(b):
+            def work():
+                self.supa.delete("tracks", f"id=eq.{t['id']}")
+                try:
+                    self.supa.remove_object(t["object_path"])
+                except Exception:
+                    pass
+                return True
+            self.online_do(work, f"Usunięto z serwera: {t['title']}")
+        self.list_popup(f"Usunąć z serwera?  {t['title']}",
+                        [{"text": "Tak, usuń dla wszystkich", "tap": go}])
+
+    def online_pick_upload(self):
+        def fetch(q):
+            ql = q.casefold()
+            rows = [t for t in self.lib.tracks()
+                    if not ql or ql in f"{t[1]} {t[2]}".casefold()][:200]
+            return [{"text": f"{t[2] or '?'} - {t[1]}\n{fmt(t[4])}",
+                     "tap": lambda b, t=t: self.online_upload(t)} for t in rows]
+        self.live_search_popup("Wyślij na serwer", "Szukaj w swojej bibliotece", fetch,
+                               empty_msg="Brak plików w bibliotece")
+
+    def online_upload(self, t):
+        path = Path(t[0])
+        ext = path.suffix.lower()
+        mime = AUDIO_MIME.get(ext)
+        if not mime:
+            self.set_status("Ten format nie jest obsługiwany")
+            return
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            self.set_status(f"Brak pliku: {e}")
+            return
+        if size > 50 * 1024 * 1024:
+            self.set_status("Plik większy niż 50 MB")
+            return
+        self.set_status(f"Wysyłanie: {t[1]} ({size // 1048576 or 1} MB)...")
+
+        def work():
+            obj = uuid.uuid4().hex + ext
+            n = self.supa.upload(obj, path, mime)
+            try:
+                self.supa.insert("tracks", {"title": (t[1] or path.stem)[:200],
+                                            "artist": (t[2] or "")[:200],
+                                            "duration": float(t[4] or 0), "object_path": obj,
+                                            "size_bytes": n, "uploaded_by": self.supa.uid})
+            except Exception:
+                self.supa.remove_object(obj)
+                raise
+            return True
+        self.online_do(work, f"Wysłano na serwer: {t[1]}")
+
+    # ------------------------------------------------------------ panel admina
+    def online_admin(self):
+        s = self.online_settings or {}
+        maint = bool(s.get("maintenance"))
+        rows = [
+            {"text": "Statystyki", "tap": lambda b: self.online_stats()},
+            {"text": "Oczekujące konta (akceptacja)", "tap": lambda b: self.online_users("pending")},
+            {"text": "Aktywni użytkownicy", "tap": lambda b: self.online_users("active")},
+            {"text": "Zablokowani (unban)", "tap": lambda b: self.online_users("banned")},
+            {"text": f"Wyłącz aplikację wszystkim (przerwa): {'WŁĄCZONA' if maint else 'wył.'}",
+             "tap": lambda b: self.online_toggle_maintenance(not maint)},
+            {"text": "Ogłoszenie na czacie", "tap": lambda b: self.online_announce()},
+            {"text": "Wspólna muzyka (dodaj / usuń)", "tap": lambda b: self.online_music()},
+            {"text": "Wyczyść cały czat", "tap": lambda b: self.online_clear_chat()},
+        ]
+        self.list_popup("Panel admina", rows)
+
+    def online_stats(self):
+        def done(res):
+            if isinstance(res, Exception):
+                self.set_status(pl_error(res))
+                return
+            d = res or {}
+            self.list_popup("Statystyki", [{"text": t, "tap": lambda b: None} for t in (
+                f"Konta: {d.get('users', 0)}",
+                f"Aktywne: {d.get('active', 0)}   Oczekujące: {d.get('pending', 0)}",
+                f"Zablokowane: {d.get('banned', 0)}",
+                f"Online (5 min): {d.get('online', 0)}",
+                f"Wiadomości na czacie: {d.get('messages', 0)}",
+                f"Utwory na serwerze: {d.get('tracks', 0)}  ({d.get('mb', 0)} MB z 1024 MB)")])
+        self.run_bg(lambda: self.supa.rpc("admin_stats"), done)
+
+    def online_users(self, status):
+        titles = {"pending": "Oczekujące konta", "active": "Użytkownicy", "banned": "Zablokowani"}
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.set_status(pl_error(res))
+                return
+            rows = []
+            for p in res:
+                tags = []
+                if p.get("role") == "admin":
+                    tags.append("admin")
+                if p.get("muted"):
+                    tags.append("wyciszony")
+                if p.get("last_seen") and status == "active":
+                    tags.append("widziany " + p["last_seen"][:16].replace("T", " "))
+                extra = f"\nPowód: {p['ban_reason']}" if status == "banned" and p.get("ban_reason") \
+                    else ("\n" + ", ".join(tags) if tags else "")
+                r = {"text": f"{p.get('display_name') or p['username']}  (@{p['username']}){extra}",
+                     "tap": lambda b, p=p: self.online_profile_popup(p), "h": 80}
+                if self.is_admin() and status == "pending":
+                    r["sides"] = [("OK", lambda b, p=p: self.online_set(
+                        p, {"status": "active"}, "Zatwierdzono"))]
+                if self.is_admin() and status == "banned":
+                    r["sides"] = [("Unban", lambda b, p=p: self.online_set(
+                        p, {"status": "active", "ban_reason": ""}, "Odblokowano"))]
+                rows.append(r)
+            if not rows:
+                rows = [{"text": "Brak", "tap": lambda b: None}]
+            self.list_popup(titles[status], rows)
+        self.run_bg(lambda: self.supa.select(
+            "profiles", f"status=eq.{status}&select=*&order=created_at.desc&limit=300"), done)
+
+    def online_admin_actions(self, p):
+        rows = []
+        st = p.get("status")
+        if st == "pending":
+            rows.append({"text": "Zatwierdź konto", "tap": lambda b: self.online_set(
+                p, {"status": "active"}, "Zatwierdzono")})
+        if st != "banned":
+            rows.append({"text": "Zbanuj (blokada aplikacji)", "tap": lambda b: self.ask(
+                "Powód bana", lambda r: self.online_set(p, {"status": "banned", "ban_reason": r[:200]},
+                                                        "Zablokowano"))})
+        else:
+            rows.append({"text": "Odbanuj", "tap": lambda b: self.online_set(
+                p, {"status": "active", "ban_reason": ""}, "Odblokowano")})
+        rows.append({"text": "Odcisz na czacie" if p.get("muted") else "Wycisz na czacie",
+                     "tap": lambda b: self.online_set(p, {"muted": not p.get("muted")},
+                                                      "Zmieniono wyciszenie")})
+        if p.get("role") == "admin":
+            rows.append({"text": "Odbierz uprawnienia admina", "tap": lambda b: self.online_set(
+                p, {"role": "user"}, "Odebrano admina")})
+        else:
+            rows.append({"text": "Nadaj uprawnienia admina", "tap": lambda b: self.online_set(
+                p, {"role": "admin"}, "Nadano admina")})
+        rows.append({"text": "Usuń wszystkie jego wiadomości", "tap": lambda b: self.online_do(
+            lambda: self.supa.update("messages", f"user_id=eq.{p['id']}&deleted=eq.false",
+                                     {"deleted": True}), "Wiadomości usunięte")})
+        return rows
+
+    def online_set(self, p, values, ok_msg):
+        self.online_do(lambda: self.supa.update("profiles", f"id=eq.{p['id']}", values), ok_msg)
+
+    def online_toggle_maintenance(self, on):
+        def apply(msg):
+            vals = {"maintenance": on, "updated_at": datetime.datetime.utcnow().isoformat() + "Z"}
+            if msg:
+                vals["maintenance_msg"] = msg[:300]
+            self.online_do(lambda: self.supa.update("app_settings", "id=eq.1", vals),
+                           "Aplikacja wyłączona dla wszystkich poza adminami" if on
+                           else "Aplikacja znowu działa dla wszystkich", self.online_check)
+        if on:
+            self.form_popup("Przerwa techniczna",
+                            [("msg", "Komunikat dla użytkowników",
+                              (self.online_settings or {}).get("maintenance_msg", ""))],
+                            [("Wyłącz aplikację", lambda v, pop: (pop.dismiss(), apply(v["msg"]))),
+                             ("Anuluj", lambda v, pop: pop.dismiss())],
+                            info="Wszyscy poza adminami zobaczą ten komunikat zamiast aplikacji.")
+        else:
+            apply("")
+
+    def online_announce(self):
+        cur = (self.online_settings or {}).get("announcement", "")
+
+        def save(v, pop):
+            pop.dismiss()
+            self.online_do(lambda: self.supa.update("app_settings", "id=eq.1",
+                                                    {"announcement": v["a"][:300]}),
+                           "Ogłoszenie zapisane" if v["a"] else "Ogłoszenie usunięte",
+                           self.online_check)
+        self.form_popup("Ogłoszenie", [("a", "Treść (puste = brak)", cur)],
+                        [("Zapisz", save), ("Anuluj", lambda v, pop: pop.dismiss())])
+
+    def online_clear_chat(self):
+        self.list_popup("Wyczyścić cały czat?", [{"text": "Tak, ukryj wszystkie wiadomości",
+                                                  "tap": lambda b: self.online_do(
+            lambda: self.supa.update("messages", "deleted=eq.false", {"deleted": True}),
+            "Czat wyczyszczony")}])
+
+
+for _name, _fn in list(vars(OnlinePlus).items()):
+    if not _name.startswith("__"):
+        setattr(MuzykaApp, _name, _fn)
+
 
 
 if __name__ == "__main__":
