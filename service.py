@@ -19,6 +19,9 @@ from pathlib import Path
 try:                                    # certyfikaty SSL w APK
     import certifi
     os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    import ssl as _ssl
+    _CAFILE = certifi.where()
+    _ssl._create_default_https_context = lambda *a, **k: _ssl.create_default_context(cafile=_CAFILE)
 except ImportError:
     pass
 
