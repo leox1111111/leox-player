@@ -8307,8 +8307,9 @@ for _name, _fn in list(vars(TilesPlus).items()):
 import uuid
 import urllib.error
 
-SUPABASE_URL = ""          # np. https://abcdefgh.supabase.co
-SUPABASE_KEY = ""          # Project Settings -> API -> anon public
+SUPABASE_URL = "https://wawckouwxagilnwqogcw.supabase.co"
+SUPABASE_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indhd2Nrb3V3eGFnaWxud3FvZ2N3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM5MjYwMzMsImV4cCI6MjEwOTUwMjAzM30"
+                ".-rCp4uOKSpFeXBNWdrsU1IOLlaLNtT1J7um9Tr3nlzQ")   # klucz publiczny (anon) - dane chroni RLS
 LOGIN_DOMAIN = "leox.app"  # konto = nazwa@leox.app (bez prawdziwej skrzynki)
 
 AUDIO_MIME = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac",

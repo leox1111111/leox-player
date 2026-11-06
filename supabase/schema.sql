@@ -218,6 +218,16 @@ drop policy if exists music_delete on storage.objects;
 create policy music_delete on storage.objects for delete to authenticated
     using (bucket_id = 'music' and public.is_admin());
 
+revoke execute on function public.handle_new_user() from public, anon, authenticated;
+revoke execute on function public.guard_profile() from public, anon, authenticated;
+revoke execute on function public.guard_message() from public, anon, authenticated;
+revoke execute on function public.admin_stats() from public, anon;
+revoke execute on function public.touch() from public, anon;
+revoke execute on function public.is_admin() from public, anon;
+revoke execute on function public.is_active() from public, anon;
+grant execute on function public.is_admin() to authenticated;
+grant execute on function public.is_active() to authenticated;
+
 -- ---------------------------------------------------------------- pierwszy admin
 -- Po założeniu konta w aplikacji uruchom (zmień nazwę na swoją):
 --   update public.profiles set role = 'admin', status = 'active' where username = 'twoja_nazwa';
