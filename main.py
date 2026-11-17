@@ -174,6 +174,67 @@ def apply_theme(name):
     globals().update(THEMES.get(resolve_theme(name), THEMES["Ciepły"]))
 
 
+PHOTO_THEME = "Ze zdjęcia"
+
+
+def theme_from_colors(cols):
+    """Kolory zdjęcia (r, g, b w 0..1, od najczęstszego) -> pełny motyw aplikacji."""
+    hsv = [colorsys.rgb_to_hsv(*c[:3]) for c in cols] or [(0.08, 0.5, 0.5)]
+    base = hsv[0]
+    cand = [h for h in hsv if h[2] > 0.35] or hsv
+    acc = max(cand, key=lambda h: h[1] * h[2])
+    if acc[1] < 0.2:                                    # zdjęcie prawie bez kolorów
+        acc = (base[0] if base[1] >= 0.12 else 0.08, 0.55, 0.9)   # szare zdjęcie: ciepły akcent
+    bh, bs = base[0], min(max(base[1], 0.25), 0.55)
+    if base[1] < 0.12:
+        bh, bs = acc[0], 0.25
+
+    def c(h, s_, v):
+        r, g, b = colorsys.hsv_to_rgb(h % 1.0, max(0.0, min(1.0, s_)), max(0.0, min(1.0, v)))
+        return (round(r, 3), round(g, 3), round(b, 3), 1)
+    ah, asat, av = acc[0], max(acc[1], 0.5), max(acc[2], 0.85)
+    return dict(BG=c(bh, bs, 0.08), BG_POP=c(bh, bs, 0.12), CARD=c(bh, bs * 0.9, 0.19),
+                CARD_HI=c(bh, bs * 0.9, 0.26), ACCENT=c(ah, asat, av),
+                ACCENT_DIM=c(ah, min(asat, 0.6), 0.42), TEXT=(1.0, 1.0, 1.0, 1),
+                MUTED=c(bh, 0.12, 0.8))
+
+
+def load_photo_theme(lib):
+    try:
+        t = json.loads(lib.get_setting("motyw_zdjecie", "") or "null")
+    except ValueError:
+        t = None
+    if t and all(k in t for k in THEME_KEYS):
+        THEMES[PHOTO_THEME] = {k: tuple(v) for k, v in t.items()}
+
+
+def image_palette_java(path):
+    """Najczęstsze kolory zdjęcia przez Androida; None poza APK."""
+    try:
+        from jnius import autoclass
+        arr = autoclass("pl.leox.media.LeoxFiles").palette(path, 8)
+    except Exception:
+        return None
+    return [(((x >> 16) & 255) / 255, ((x >> 8) & 255) / 255, (x & 255) / 255) for x in arr] or None
+
+
+def image_palette_kivy(path):
+    """Zapas (Pydroid): próbkowanie siatki 24x24 przez Kivy - tylko w wątku interfejsu."""
+    im = CoreImage(path, keep_data=True)
+    w, h = im.size
+    counts, sums = Counter(), {}
+    for i in range(24):
+        for j in range(24):
+            r, g, b, _a = im.read_pixel(int(w * (i + 0.5) / 24), int(h * (j + 0.5) / 24))
+            key = (int(r * 15), int(g * 15), int(b * 15))
+            counts[key] += 1
+            sr = sums.setdefault(key, [0.0, 0.0, 0.0])
+            sr[0] += r
+            sr[1] += g
+            sr[2] += b
+    return [tuple(x / counts[k] for x in sums[k]) for k, _n in counts.most_common(8)]
+
+
 def safe_name(s):
     return re.sub(r'[\\/:*?"<>|]+', "_", s or "").strip()[:120] or "bez_nazwy"
 
@@ -2873,6 +2934,7 @@ class MuzykaApp(App):
         if MUSIC_DIR not in self.dl_dir.parents:
             dirs.append(self.dl_dir)
         self.lib = Library(Path(self.user_data_dir) / "library.db", dirs)
+        load_photo_theme(self.lib)
         apply_theme(self.lib.get_setting("motyw", "Ciepły"))
         Window.clearcolor = BG
         self.apk = self.apk_build = service_available()
@@ -2890,6 +2952,8 @@ class MuzykaApp(App):
         if self.apk:
             self.player.apply_fx()
             Clock.schedule_once(lambda dt: self.player.cmd(cmd="hello"), 1.0)
+            Clock.schedule_once(lambda dt: self.player.cmd(
+                cmd="notify", db=str(Path(self.user_data_dir) / "library.db")), 1.2)
             Clock.schedule_once(self.check_service, 12)
         else:
             self.player.on_done = self.bg_done
@@ -5045,6 +5109,63 @@ class MuzykaApp(App):
         self.setup_fx()
         self.set_status(f"Animacje: {'wł.' if ANIM['on'] else 'wył.'}")
 
+    def theme_from_photo(self):
+        def picked(path, name):
+            if not path:
+                self.set_status(name)
+                return
+            self.set_status("Liczenie kolorów ze zdjęcia...")
+            wall = Path(self.user_data_dir) / "tapeta.jpg"
+
+            def work():
+                tmp = str(wall) + ".tmp"
+                ok = False
+                try:
+                    from jnius import autoclass
+                    ok = autoclass("pl.leox.media.LeoxFiles").scaledJpeg(path, tmp, 1600)
+                except Exception:
+                    ok = False
+                if ok:
+                    os.replace(tmp, wall)
+                else:
+                    import shutil
+                    shutil.copyfile(path, wall)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                return image_palette_java(str(wall))
+
+            def done(res):
+                if isinstance(res, Exception):
+                    self.set_status(f"Nie udało się wczytać zdjęcia: {res}")
+                    return
+                cols = res
+                if not cols:
+                    try:
+                        cols = image_palette_kivy(str(wall))
+                    except Exception as e:
+                        self.set_status(f"Nie udało się odczytać kolorów: {e}")
+                        return
+                t = theme_from_colors(cols)
+                THEMES[PHOTO_THEME] = t
+                self.lib.set_setting("motyw_zdjecie", json.dumps(t))
+                self.lib.set_setting("tapeta", "1")
+                self.lib.set_setting("motyw", PHOTO_THEME)
+                apply_theme(PHOTO_THEME)
+                self.theme_now = PHOTO_THEME
+                self.rebuild_ui()
+                self.setup_fx()
+                self.set_status("Motyw ze zdjęcia ustawiony")
+            self.run_bg(work, done)
+        self.pick_file("image/*", picked)
+
+    def toggle_wallpaper(self):
+        on = self.lib.get_setting("tapeta", "0") != "1"
+        self.lib.set_setting("tapeta", "1" if on else "0")
+        self.setup_fx()
+        self.set_status(f"Tapeta: {'wł.' if on else 'wył.'}")
+
     def show_themes(self):
         cur = self.lib.get_setting("motyw", "Ciepły")
 
@@ -5057,9 +5178,15 @@ class MuzykaApp(App):
             self.theme_now = resolve_theme(name)
             self.rebuild_ui()
             self.set_status(f"Motyw: {name}")
-        rows = [{"text": f"[b]{AUTO_THEME}[/b]  dzień / wieczór / noc"
-                         + ("  (obecny)" if cur == AUTO_THEME else ""),
-                 "markup": True, "tap": lambda b: choose(AUTO_THEME)}]
+        rows = [{"text": "[b]Motyw ze zdjęcia[/b]  wybierz zdjęcie - kolory i tapeta",
+                 "markup": True, "tap": lambda b: self.theme_from_photo(), "bg": list(ACCENT_DIM)}]
+        if (Path(self.user_data_dir) / "tapeta.jpg").exists():
+            on = self.lib.get_setting("tapeta", "0") == "1"
+            rows.append({"text": f"Tapeta ze zdjęcia: {'wł.' if on else 'wył.'}",
+                         "tap": lambda b: self.toggle_wallpaper()})
+        rows.append({"text": f"[b]{AUTO_THEME}[/b]  dzień / wieczór / noc"
+                             + ("  (obecny)" if cur == AUTO_THEME else ""),
+                     "markup": True, "tap": lambda b: choose(AUTO_THEME)})
         for n, t in THEMES.items():
             mark = "  (obecny)" if n == cur else ""
             rows.append({"text": f"[color={hexc(t['ACCENT'])}][b]{n}[/b][/color]"
@@ -5084,6 +5211,15 @@ class MuzykaApp(App):
         for w in (self.fx_back, self.fx_front):
             if w is not None and w.parent:
                 w.parent.remove_widget(w)
+        wp = getattr(self, "wallpaper", None)
+        if wp is not None and wp.parent:
+            wp.parent.remove_widget(wp)
+        self.wallpaper = None
+        wf = Path(self.user_data_dir) / "tapeta.jpg"
+        if self.lib.get_setting("tapeta", "0") == "1" and wf.exists():
+            from kivy.uix.image import Image as KImage
+            self.wallpaper = KImage(source=str(wf), fit_mode="cover", opacity=0.3, nocache=True)
+            Window.add_widget(self.wallpaper, canvas="before")
         mode = self.lib.get_setting("efekt", "Świetliki") if ANIM["on"] else "Wyłączone"
         self.fx_back = FxBack(mode=mode)
         self.fx_front = FxFront(border=self.lib.get_setting("neon", "1") == "1")
@@ -8369,7 +8505,7 @@ class Supa:
 
     def __init__(self, url, key, load, save):
         self.url, self.key = url.rstrip("/"), key
-        self._save_fn = save
+        self._save_fn, self._load_fn = save, load
         try:
             self.session = json.loads(load() or "{}")
         except ValueError:
@@ -8400,6 +8536,13 @@ class Supa:
 
     def refresh(self):
         with self.lock:
+            try:                                # usługa w tle mogła już odświeżyć sesję
+                fresh = json.loads(self._load_fn() or "{}")
+                if fresh.get("refresh_token") and \
+                        fresh.get("expires_at", 0) > self.session.get("expires_at", 0):
+                    self.session = fresh
+            except ValueError:
+                pass
             if self.session.get("expires_at", 0) - 60 > time.time():
                 return
             s = self._raw("POST", "/auth/v1/token?grant_type=refresh_token",
@@ -8667,6 +8810,8 @@ class OnlinePlus:
                     return
                 mv.dismiss()
                 self.online_login_view = None
+                if self.apk:
+                    self.player.cmd(cmd="notify", db=str(Path(self.user_data_dir) / "library.db"))
                 if register:
                     self.set_status("Konto założone - czeka na akceptację administratora")
                 self.online_check()
@@ -8685,6 +8830,10 @@ class OnlinePlus:
         self.run_bg(work, lambda res: self.online_login("Wylogowano."))
 
     # ------------------------------------------------------------ menu
+    def is_creator(self):
+        me = getattr(self, "online_me", None)
+        return self.is_active_user() and role_of(me) in ("admin", "creator")
+
     def is_admin(self):
         me = getattr(self, "online_me", None)
         return bool(me and me.get("role") == "admin" and me.get("status") == "active")
@@ -8706,8 +8855,7 @@ class OnlinePlus:
         name = me.get("display_name") or me.get("username") or "?"
         st = {"pending": "czeka na akceptację", "active": "aktywne",
               "banned": "zablokowane"}.get(me.get("status"), "?")
-        rows = [{"text": f"{name}  (@{me.get('username', '?')})\nKonto: {st}"
-                         f"{'  -  ADMIN' if self.is_admin() else ''}",
+        rows = [{"text": f"{name}  (@{me.get('username', '?')})\nKonto: {st}  -  rola: {role_of(me)}",
                  "tap": lambda b: self.online_edit_profile(), "h": 80,
                  "avatar": me.get("avatar_path", "")}]
         if self.is_active_user():
@@ -8721,6 +8869,10 @@ class OnlinePlus:
             rows.append({"text": "Usuń zdjęcie profilowe",
                          "tap": lambda b: self.online_remove_avatar(me)})
         rows.append({"text": "Zmień hasło", "tap": lambda b: self.online_password()})
+        notif = self.lib.get_setting("powiadomienia", "1") == "1"
+        rows.append({"text": f"Powiadomienia z czatu{' i o nowych kontach' if self.is_admin() else ''}: "
+                             f"{'wł.' if notif else 'wył.'}",
+                     "tap": lambda b: self.online_toggle_notify()})
         if self.is_admin():
             rows.append({"text": "PANEL ADMINA", "tap": lambda b: self.online_admin(),
                          "bg": list(ACCENT_DIM)})
@@ -8729,6 +8881,14 @@ class OnlinePlus:
         self.online_check()
 
     # ------------------------------------------------------------ profil
+    def online_toggle_notify(self):
+        on = self.lib.get_setting("powiadomienia", "1") != "1"
+        self.lib.set_setting("powiadomienia", "1" if on else "0")
+        if self.apk:
+            self.player.cmd(cmd="notify", db=str(Path(self.user_data_dir) / "library.db"))
+        self.set_status("Powiadomienia włączone (sprawdzane co ok. 45 s, także po zamknięciu aplikacji)"
+                        if on else "Powiadomienia wyłączone")
+
     def online_edit_profile(self):
         me = self.online_me or {}
 
@@ -8757,9 +8917,7 @@ class OnlinePlus:
 
     def online_profile_popup(self, p):
         joined = (p.get("created_at") or "")[:10]
-        tags = []
-        if p.get("role") == "admin":
-            tags.append("admin")
+        tags = [role_of(p)]
         if p.get("muted"):
             tags.append("wyciszony")
         if p.get("status") != "active":
@@ -8809,7 +8967,8 @@ class OnlinePlus:
             st["profiles"][m["user_id"]] = dict(p, id=m["user_id"])
             name = escape_markup(p.get("display_name") or p.get("username") or "?")
             when = (m.get("created_at") or "")[11:16]
-            badge = " [color=#e08f52](admin)[/color]" if p.get("role") == "admin" else ""
+            badge = {"admin": " [color=#e08f52](admin)[/color]",
+                     "creator": " [color=#7fc8ff](creator)[/color]"}.get(role_of(p), "")
             text = "[i]wiadomość usunięta[/i]" if m.get("deleted") else escape_markup(m["content"])
             me_name = "@" + ((self.online_me or {}).get("username") or "~")
             if not m.get("deleted") and me_name.lower() in m["content"].lower():
@@ -8839,9 +8998,11 @@ class OnlinePlus:
                 st["last"] = 0
             last = st["last"]
 
+            self.lib.set_setting("czat_otwarty", str(time.time()))   # usługa nie powiadamia w trakcie
+
             def work():
                 sel = "select=id,content,created_at,deleted,user_id," \
-                      "profiles(username,display_name,role,avatar_path)"
+                      "profiles(username,display_name,role,creator,avatar_path)"
                 if last:
                     msgs = supa.select("messages", f"{sel}&id=gt.{last}&order=id.asc&limit=100")
                 else:
@@ -8935,6 +9096,8 @@ class OnlinePlus:
     def online_music(self):
         supa = self.supa
         admin = self.is_admin()
+        creator = self.is_creator()
+        uid = self.supa.uid
         cache = {}
 
         def fetch(q):
@@ -8949,13 +9112,13 @@ class OnlinePlus:
                 r = {"text": f"{t['artist'] or '?'} - {t['title']}\n{fmt(t['duration'])}",
                      "tap": lambda b, i=i: self.online_play_shared(cache["rows"], i),
                      "sides": [("Pobierz", lambda b, t=t: self.online_download_shared(t))]}
-                if admin:
+                if admin or (creator and t.get("uploaded_by") == uid):
                     r["sides"].append(("Usuń", lambda b, t=t: self.online_delete_track(t)))
                 out.append(r)
             return out
         footer = [("Graj wszystko", lambda b: cache.get("rows") and
                    self.online_play_shared(cache["rows"], 0))]
-        if admin:
+        if creator:
             footer.append(("Z biblioteki", lambda b: self.online_pick_upload()))
             footer.append(("Z pliku", lambda b: self.online_upload_file()))
         self.live_search_popup("Wspólna muzyka", "Szukaj na serwerze", fetch, footer,
@@ -9038,7 +9201,7 @@ class OnlinePlus:
         self.set_status(f"Wysyłanie: {t[1]} ({size // 1048576 or 1} MB)...")
 
         def work():
-            obj = uuid.uuid4().hex + ext
+            obj = f"{self.supa.uid}/{uuid.uuid4().hex}{ext}"
             n = self.supa.upload(obj, path, mime)
             try:
                 self.supa.insert("tracks", {"title": (t[1] or path.stem)[:200],
@@ -9100,9 +9263,7 @@ class OnlinePlus:
                 return
             rows = []
             for p in res:
-                tags = []
-                if p.get("role") == "admin":
-                    tags.append("admin")
+                tags = [] if role_of(p) == "member" else [role_of(p)]
                 if p.get("muted"):
                     tags.append("wyciszony")
                 if p.get("last_seen") and status == "active" and not is_online(p):
@@ -9146,12 +9307,8 @@ class OnlinePlus:
         rows.append({"text": "Odcisz na czacie" if p.get("muted") else "Wycisz na czacie",
                      "tap": lambda b: self.online_set(p, {"muted": not p.get("muted")},
                                                       "Zmieniono wyciszenie")})
-        if p.get("role") == "admin":
-            rows.append({"text": "Odbierz uprawnienia admina", "tap": lambda b: self.online_set(
-                p, {"role": "user"}, "Odebrano admina")})
-        else:
-            rows.append({"text": "Nadaj uprawnienia admina", "tap": lambda b: self.online_set(
-                p, {"role": "admin"}, "Nadano admina")})
+        rows.append({"text": f"Rola: {role_of(p)}  (zmień: member / creator / admin)",
+                     "tap": lambda b: self.online_role(p)})
         rows.append({"text": "Ustaw nowe hasło (zapomniał)", "tap": lambda b: self.ask(
             f"Nowe hasło dla @{p['username']} (min. 6 znaków)", lambda pw: self.online_do(
                 lambda: self.supa.rpc("admin_set_password", {"target": p["id"], "new_password": pw}),
@@ -9165,6 +9322,19 @@ class OnlinePlus:
                 lambda: self.supa.rpc("admin_delete_user", {"target": p["id"]}),
                 f"Usunięto konto @{p['username']}")}])})
         return rows
+
+    def online_role(self, p):
+        opts = [("member", "zwykły użytkownik: czat, słuchanie wspólnej muzyki",
+                 {"role": "user", "creator": False}),
+                ("creator", "może dodawać i usuwać własne utwory we wspólnej muzyce",
+                 {"role": "user", "creator": True}),
+                ("admin", "pełny panel admina", {"role": "admin", "creator": False})]
+        cur = role_of(p)
+        self.list_popup(f"Rola @{p['username']}", [
+            {"text": f"[b]{name}[/b]{'  (obecna)' if name == cur else ''}\n{desc}", "markup": True,
+             "h": 84, "tap": lambda b, name=name, vals=vals: self.online_set(
+                 p, vals, f"@{p['username']} ma teraz rolę {name}")}
+            for name, desc, vals in opts])
 
     def online_ban(self, p):
         opts = [("1 godzina", 1), ("1 dzień", 24), ("7 dni", 24 * 7), ("30 dni", 24 * 30),
@@ -9429,6 +9599,18 @@ class OnlinePlus:
                 tmp = tmp.rename(tmp.with_suffix(ext))
             self.online_upload((str(tmp), title, artist, "", dur), cleanup=True)
         self.pick_file("audio/*", picked)
+
+
+ROLE_NAMES = {"admin": "admin", "creator": "creator", "member": "member"}
+
+
+def role_of(p):
+    """Rola konta: admin, creator albo member."""
+    if not p:
+        return "member"
+    if p.get("role") == "admin":
+        return "admin"
+    return "creator" if p.get("creator") else "member"
 
 
 def ban_expired(p):

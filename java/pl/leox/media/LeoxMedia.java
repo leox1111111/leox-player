@@ -284,4 +284,56 @@ public class LeoxMedia {
         } catch (Throwable t) { }
         try { nm().cancel(NOTIF_ID); } catch (Throwable t) { }
     }
+    static final String CH_IDLE = "leox_tlo";
+
+    /** Usluga zostaje w tle (bez muzyki), zeby sprawdzac czat - ciche, minimalne powiadomienie. */
+    @SuppressWarnings("deprecation")
+    public static void idle(String text) {
+        if (ctx == null) return;
+        metaKey = "";
+        try {
+            if (session != null) session.setActive(false);
+        } catch (Throwable t) { }
+        abandonFocus();
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel ch = new NotificationChannel(CH_IDLE, "Praca w tle",
+                    NotificationManager.IMPORTANCE_MIN);
+            ch.setShowBadge(false);
+            nm().createNotificationChannel(ch);
+        }
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(ctx, CH_IDLE) : new Notification.Builder(ctx);
+        b.setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setContentTitle("Leox Player")
+                .setContentText(text)
+                .setShowWhen(false)
+                .setOngoing(true);
+        if (Build.VERSION.SDK_INT < 26) b.setPriority(Notification.PRIORITY_MIN);
+        PendingIntent open = openApp();
+        if (open != null) b.setContentIntent(open);
+        try {
+            if (ctx instanceof Service) ((Service) ctx).startForeground(NOTIF_ID, b.build());
+        } catch (Throwable t) { }
+    }
+
+    /** Zwykle powiadomienie (czat, konta do akceptacji). */
+    public static void notify(int id, String channel, String channelName, String title, String text) {
+        if (ctx == null) return;
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel ch = new NotificationChannel(channel, channelName,
+                    NotificationManager.IMPORTANCE_DEFAULT);
+            nm().createNotificationChannel(ch);
+        }
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(ctx, channel) : new Notification.Builder(ctx);
+        b.setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setStyle(new Notification.BigTextStyle().bigText(text))
+                .setAutoCancel(true)
+                .setShowWhen(true);
+        PendingIntent open = openApp();
+        if (open != null) b.setContentIntent(open);
+        try { nm().notify(id, b.build()); } catch (Throwable t) { }
+    }
 }

@@ -11,8 +11,11 @@ import json
 import os
 import queue
 import socket
+import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -47,6 +50,12 @@ except Exception:
     Equalizer = BassBoost = None
 
 CACHE = Path(SVC.getCacheDir().getAbsolutePath())
+FILES = Path(SVC.getFilesDir().getAbsolutePath())
+
+# ten sam serwer co w main.py (klucz publiczny anon - dane chroni RLS)
+SUPABASE_URL = "https://wawckouwxagilnwqogcw.supabase.co"
+SUPABASE_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indhd2Nrb3V3eGFnaWxud3FvZ2N3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM5MjYwMzMsImV4cCI6MjEwOTUwMjAzM30"
+                ".-rCp4uOKSpFeXBNWdrsU1IOLlaLNtT1J7um9Tr3nlzQ")
 
 
 def log(*a):
@@ -130,6 +139,160 @@ def fetch_art(url):
         return ""
 
 
+class Powiadomienia(threading.Thread):
+    """Co ok. 45 s sprawdza czat i (dla admina) konta do akceptacji; pokazuje powiadomienia Androida.
+    Sesję logowania czyta z bazy aplikacji (library.db) i odświeża ją tam, gdy wygasa."""
+    INTERVAL = 45
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.wake = threading.Event()
+        self.state_file = FILES / "powiadomienia.json"
+        try:
+            self.state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except Exception:
+            self.state = {}
+        self.state.setdefault("last_msg", 0)
+        self.state.setdefault("pending", [])
+        self.db = Path(self.state.get("db") or FILES / "library.db")
+
+    def save(self):
+        try:
+            self.state_file.write_text(json.dumps(self.state), encoding="utf-8")
+        except OSError:
+            pass
+
+    def set_db(self, path):
+        if path and Path(path) != self.db:
+            self.db = Path(path)
+            self.state["db"] = str(path)
+            self.save()
+
+    # --- ustawienia aplikacji (wspólna baza)
+    def setting(self, key, default=""):
+        try:
+            con = sqlite3.connect(str(self.db), timeout=10)
+            try:
+                row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            finally:
+                con.close()
+            return default if row is None or row[0] is None else str(row[0])
+        except Exception:
+            return default
+
+    def set_setting(self, key, value):
+        con = sqlite3.connect(str(self.db), timeout=10)
+        try:
+            con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, value))
+            con.commit()
+        finally:
+            con.close()
+
+    def enabled(self):
+        if self.setting("powiadomienia", "1") != "1":
+            return False
+        try:
+            return bool(json.loads(self.setting("supa_sesja", "") or "{}").get("refresh_token"))
+        except ValueError:
+            return False
+
+    # --- serwer
+    def http(self, method, path, body=None, token=None):
+        h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {token or SUPABASE_KEY}"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            h["Content-Type"] = "application/json"
+        req = urllib.request.Request(SUPABASE_URL + path, data=data, method=method, headers=h)
+        with urllib.request.urlopen(req, timeout=25) as r:
+            txt = r.read()
+        return json.loads(txt) if txt else None
+
+    def token(self):
+        s = json.loads(self.setting("supa_sesja", "") or "{}")
+        if not s.get("refresh_token"):
+            return None, None
+        if s.get("expires_at", 0) - 120 < time.time():
+            try:
+                r = self.http("POST", "/auth/v1/token?grant_type=refresh_token",
+                              {"refresh_token": s["refresh_token"]})
+            except urllib.error.HTTPError:
+                return None, None               # sesję odnowi aplikacja przy logowaniu
+            # aplikacja mogła odświeżyć w tym samym czasie - nie nadpisujemy nowszej sesji
+            cur = json.loads(self.setting("supa_sesja", "") or "{}")
+            if cur.get("refresh_token") == s["refresh_token"]:
+                r["expires_at"] = time.time() + int(r.get("expires_in") or 3600)
+                self.set_setting("supa_sesja", json.dumps(r))
+                s = r
+            else:
+                s = cur
+        return s.get("access_token"), (s.get("user") or {}).get("id")
+
+    def tick(self):
+        tok, uid = self.token()
+        if not tok or not uid:
+            return
+        me = self.http("GET", f"/rest/v1/profiles?id=eq.{uid}&select=username,role,status", token=tok)
+        me = me[0] if me else None
+        if not me or me.get("status") != "active":
+            return
+        last = int(self.state.get("last_msg") or 0)
+        if not last:
+            top = self.http("GET", "/rest/v1/messages?select=id&order=id.desc&limit=1", token=tok) or []
+            self.state["last_msg"] = top[0]["id"] if top else 0
+        else:
+            msgs = self.http("GET", "/rest/v1/messages?select=id,content,user_id,deleted,"
+                             f"profiles(username,display_name)&id=gt.{last}&order=id.asc&limit=30",
+                             token=tok) or []
+            if msgs:
+                self.state["last_msg"] = max(m["id"] for m in msgs)
+            try:
+                chat_open = time.time() - float(self.setting("czat_otwarty", "0") or 0) < 12
+            except ValueError:
+                chat_open = False
+            new = [m for m in msgs if m.get("user_id") != uid and not m.get("deleted")]
+            if new and not chat_open:
+                tag = "@" + (me.get("username") or "~")
+                mention = any(tag in (m.get("content") or "").lower() for m in new)
+
+                def who(m):
+                    p = m.get("profiles") or {}
+                    return p.get("display_name") or p.get("username") or "?"
+                if len(new) == 1:
+                    title = f"Czat Leox: {who(new[0])}"
+                    text = new[0]["content"]
+                else:
+                    title = f"Czat Leox: {len(new)} nowe wiadomości"
+                    text = "\n".join(f"{who(m)}: {m['content']}" for m in new[-6:])
+                if mention:
+                    title = "Ktoś Cię wspomniał na czacie"
+                Media.notify(2001, "leox_czat", "Czat", title, text[:600])
+        if me.get("role") == "admin":
+            pend = self.http("GET", "/rest/v1/profiles?status=eq.pending&select=id,username"
+                             "&order=created_at.asc&limit=50", token=tok) or []
+            seen = set(self.state.get("pending") or [])
+            fresh = [p for p in pend if p["id"] not in seen]
+            if fresh:
+                names = ", ".join("@" + p["username"] for p in fresh)
+                title = ("Nowe konto czeka na akceptację" if len(fresh) == 1
+                         else f"{len(fresh)} nowe konta czekają na akceptację")
+                Media.notify(2002, "leox_konta", "Konta do akceptacji", title,
+                             f"{names}\nWięcej -> Społeczność -> Panel admina")
+            self.state["pending"] = [p["id"] for p in pend]
+        self.save()
+
+    def run(self):
+        self.wake.wait(8)
+        while True:
+            self.wake.clear()
+            try:
+                if self.enabled():
+                    self.tick()
+            except Exception as e:
+                log("powiadomienia:", e)
+            self.wake.wait(self.INTERVAL)
+
+
 class Usluga:
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -149,8 +312,16 @@ class Usluga:
         self.art, self.focus_paused, self.xf_started = "", False, False
         self.last_status, self.last_notif, self.notif_key = 0.0, 0.0, None
         Media.init(SVC)
+        self.notifier = Powiadomienia()
+        self.notifier.start()
 
     # ------------------------------------------------------------ komunikacja
+    def media_off(self):
+        """Koniec muzyki: znika panel; przy włączonych powiadomieniach usługa zostaje w tle."""
+        Media.remove()
+        if self.notifier.enabled():
+            Media.idle("Powiadomienia z czatu są włączone")
+
     def send(self, **m):
         try:
             self.out.sendto(json.dumps(m).encode("utf-8"), ("127.0.0.1", APP_PORT))
@@ -175,7 +346,7 @@ class Usluga:
             self.stop_mp()
             self.active = self.paused = self.loading = False
             self.token += 1
-            Media.remove()
+            self.media_off()
             self.notif_key = None
         elif c == "pause":
             self.pause()
@@ -199,6 +370,11 @@ class Usluga:
             self.apply_settings(m)
         elif c == "stop_after":
             self.stop_after = bool(m.get("on"))
+        elif c == "notify":
+            self.notifier.set_db(m.get("db"))
+            self.notifier.wake.set()
+            if not self.active:
+                self.media_off()
         elif c == "quit":
             self.end("quit")
 
@@ -321,7 +497,7 @@ class Usluga:
     def fail(self, msg):
         self.stop_mp()
         self.active = self.loading = False
-        Media.remove()
+        self.media_off()
         self.notif_key = None
         self.send(event="error", msg=str(msg))
 
@@ -330,7 +506,7 @@ class Usluga:
         self.stop_mp()
         self.active = self.paused = self.loading = False
         self.stop_after = False
-        Media.remove()
+        self.media_off()
         self.notif_key = None
         if reason:
             self.send(event="ended", reason=reason)
