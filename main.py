@@ -3558,6 +3558,7 @@ class MuzykaApp(App):
 
     def on_resume(self):
         self.in_bg = False
+        self.update_on_resume()
         try:
             if time.time() - float(self.lib.get_setting("aktualizacja_sprawdzona", "0") or 0) > 6 * 3600:
                 Clock.schedule_once(lambda dt: self.check_update(), 2)
@@ -5041,6 +5042,8 @@ class MuzykaApp(App):
             ("Społeczność: czat, wspólna muzyka, profil" + (" (ADMIN)" if self.is_admin() else ""),
              lambda b: self.show_online()),
             (f"Sprawdź aktualizacje (masz {self.app_version()})", lambda b: self.check_update(True)),
+            (f"Automatyczne aktualizacje: {'wł.' if self.auto_update_on() else 'wył.'}",
+             lambda b: self.toggle_auto_update()),
             ("Szukaj wszędzie (biblioteka, YouTube, radio)", lambda b: self.show_global_search()),
             (f"Wyślij na komputer / telewizor{' (' + self.cast.name + ')' if self.cast else ''}",
              lambda b: self.show_cast_menu()),
@@ -5211,6 +5214,7 @@ class MuzykaApp(App):
     def on_pause(self):
         self.in_bg = True
         self.autobackup()
+        self.update_on_pause()
         return True                             # muzyka gra dalej po wyjściu z aplikacji
 
     def setup_fx(self):
@@ -9669,6 +9673,22 @@ class UpdatePlus:
     def app_version(self):
         return f"1.{APP_BUILD}" if APP_BUILD else "1.0"
 
+    def auto_update_on(self):
+        return self.lib.get_setting("auto_aktualizacje", "1") == "1"
+
+    def toggle_auto_update(self):
+        on = not self.auto_update_on()
+        self.lib.set_setting("auto_aktualizacje", "1" if on else "0")
+        self.set_status("Automatyczne aktualizacje: " + ("wł." if on else "wył. (będzie pytać)"))
+
+    def is_playing(self):
+        return bool(getattr(self, "active", False)) and not getattr(self.player, "paused", False)
+
+    def updater(self):
+        from jnius import autoclass
+        return (autoclass("pl.leox.media.LeoxUpdate"),
+                autoclass("org.kivy.android.PythonActivity").mActivity)
+
     def check_update(self, manual=False):
         if not getattr(self, "apk_build", False) or not APP_BUILD:
             if manual:
@@ -9691,34 +9711,46 @@ class UpdatePlus:
                 if manual:
                     self.set_status(f"Masz najnowszą wersję ({self.app_version()})")
                 return
+            if not manual and self.auto_update_on():
+                self.download_update(n, install_now=False)
+                return
             if not manual and self.lib.get_setting("pomin_wersje", "") == str(n):
                 return
             notes = str(res.get("notes") or "")[:300]
             self.list_popup(f"Nowa wersja 1.{n}  (masz {self.app_version()})", [
                 {"text": f"[b]Zainstaluj teraz[/b]\n{escape_markup(notes)}", "markup": True,
-                 "h": 110, "tap": lambda b: self.do_update(n), "bg": list(ACCENT_DIM)},
+                 "h": 110, "tap": lambda b: self.download_update(n, install_now=True),
+                 "bg": list(ACCENT_DIM)},
                 {"text": "Pomiń tę wersję",
                  "tap": lambda b: self.lib.set_setting("pomin_wersje", str(n))}])
         self.run_bg(work, done)
 
-    def do_update(self, n):
+    def download_update(self, n, install_now):
         try:
-            from jnius import autoclass
-            Upd = autoclass("pl.leox.media.LeoxUpdate")
-            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            Upd, act = self.updater()
         except Exception as e:
             self.set_status(f"Aktualizacja niedostępna: {e}")
             return
         if not Upd.canInstall(act):
             self.list_popup("Zezwól na aktualizacje", [
                 {"text": "Android musi pozwolić Leox Player instalować aktualizacje.\n"
-                         "Dotknij, włącz \"Zezwalaj z tego źródła\", wróć i jeszcze raz wybierz Zainstaluj.",
+                         "Dotknij, włącz \"Zezwalaj z tego źródła\" i wróć do aplikacji.",
                  "h": 120, "tap": lambda b: Upd.openInstallSettings(act)}])
             return
-        dest = Path(self.user_data_dir) / "aktualizacja.apk"
+        dest = Path(self.user_data_dir) / f"aktualizacja-{n}.apk"
+        ready = getattr(self, "update_ready", None)
+        if ready and ready[0] == n and Path(ready[1]).exists():
+            if install_now:
+                self.install_update()
+            return
         url = UPDATE_APK_URL.format(n=n)
 
         def work():
+            for old in Path(self.user_data_dir).glob("aktualizacja-*.apk"):
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=60) as r:
                 total = int(r.headers.get("Content-Length") or 0)
@@ -9731,7 +9763,7 @@ class UpdatePlus:
                             break
                         f.write(chunk)
                         got += len(chunk)
-                        if total:
+                        if install_now and total:
                             pct = got * 100 // total
                             Clock.schedule_once(lambda dt, p=pct: self.set_status(
                                 f"Pobieranie aktualizacji: {p}%"))
@@ -9740,15 +9772,55 @@ class UpdatePlus:
 
         def done(res):
             if isinstance(res, Exception):
-                self.set_status(f"Nie udało się pobrać aktualizacji: {pl_error(res)}")
+                if install_now:
+                    self.set_status(f"Nie udało się pobrać aktualizacji: {pl_error(res)}")
                 return
-            err = Upd.install(act, res)
-            if err:
-                self.set_status(f"Instalacja nie ruszyła: {err}"[:150])
+            self.update_ready = (n, res)
+            if install_now:
+                self.install_update()
             else:
-                self.set_status("Potwierdź instalację w oknie Androida")
-        self.set_status("Pobieranie aktualizacji...")
+                self.set_status(f"Pobrano wersję 1.{n} - zainstaluje się sama, "
+                                f"gdy wyjdziesz z aplikacji (i nic nie gra)")
+        if install_now:
+            self.set_status("Pobieranie aktualizacji...")
         self.run_bg(work, done)
+
+    def install_update(self):
+        ready = getattr(self, "update_ready", None)
+        if not ready or not Path(ready[1]).exists():
+            return
+        try:
+            Upd, act = self.updater()
+        except Exception:
+            return
+
+        def go():
+            try:
+                Upd.install(act, ready[1], True)
+            finally:
+                try:
+                    from jnius import detach
+                    detach()
+                except Exception:
+                    pass
+        self.set_status(f"Instalowanie wersji 1.{ready[0]}... aplikacja uruchomi się od nowa")
+        threading.Thread(target=go, daemon=True).start()
+
+    def update_on_pause(self):
+        """Wyjście z aplikacji: gotowa aktualizacja instaluje się sama, jeśli nic nie gra."""
+        if getattr(self, "update_ready", None) and self.auto_update_on() and not self.is_playing():
+            self.install_update()
+
+    def update_on_resume(self):
+        """Android chciał potwierdzenia, gdy aplikacja była w tle - pokazujemy je teraz."""
+        if not getattr(self, "apk_build", False):
+            return
+        try:
+            Upd, act = self.updater()
+            if Upd.hasPending():
+                Upd.showPending(act)
+        except Exception:
+            pass
 
 
 for _name, _fn in list(vars(UpdatePlus).items()):

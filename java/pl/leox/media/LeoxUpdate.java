@@ -16,7 +16,21 @@ import java.io.OutputStream;
 /** Instalacja pobranej aktualizacji (systemowy instalator pakietow). */
 public class LeoxUpdate {
     static volatile String status = "";
+    static volatile Intent pending;          // okno potwierdzenia, gdy aplikacja byla w tle
     static BroadcastReceiver receiver;
+
+    /** Czy czeka okno potwierdzenia instalacji (pokaz je, gdy aplikacja jest na wierzchu). */
+    public static boolean hasPending() {
+        return pending != null;
+    }
+
+    public static void showPending(Context ctx) {
+        Intent i = pending;
+        pending = null;
+        if (i != null) {
+            try { ctx.startActivity(i); } catch (Throwable t) { pending = i; }
+        }
+    }
 
     /** Ostatni stan instalacji: "", "ok", "anulowano" albo opis bledu. */
     public static String status() {
@@ -40,6 +54,11 @@ public class LeoxUpdate {
 
     /** Wysyla plik APK do instalatora; Android pokaze okno potwierdzenia. Zwraca "" albo blad. */
     public static String install(final Context ctx, String apkPath) {
+        return install(ctx, apkPath, true);
+    }
+
+    /** silent: Android 12+ instaluje bez pytania, gdy poprzednia wersje zainstalowala ta aplikacja. */
+    public static String install(final Context ctx, String apkPath, boolean silent) {
         status = "";
         try {
             final String action = ctx.getPackageName() + ".INSTALL_STATUS";
@@ -51,7 +70,8 @@ public class LeoxUpdate {
                             Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
                             if (confirm != null) {
                                 confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                                c.startActivity(confirm);
+                                pending = confirm;
+                                try { c.startActivity(confirm); pending = null; } catch (Throwable t) { }
                             }
                         } else if (st == PackageInstaller.STATUS_SUCCESS) {
                             status = "ok";
@@ -73,6 +93,9 @@ public class LeoxUpdate {
             PackageInstaller pi = ctx.getPackageManager().getPackageInstaller();
             PackageInstaller.SessionParams params =
                     new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            if (silent && Build.VERSION.SDK_INT >= 31) {
+                params.setRequireUserAction(2);     // USER_ACTION_NOT_REQUIRED
+            }
             int id = pi.createSession(params);
             PackageInstaller.Session s = pi.openSession(id);
             InputStream in = new FileInputStream(apkPath);
