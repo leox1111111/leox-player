@@ -2925,6 +2925,7 @@ class MuzykaApp(App):
         self.title = "Leox Player"
         threading.Thread(target=patch_ytdlp, daemon=True).start()
         Clock.schedule_once(lambda dt: self.online_start(), 1.5)
+        Clock.schedule_once(lambda dt: self.check_update(), 8)
         request_perms()
         Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
         setup_font(Path(self.user_data_dir) / "fonts")
@@ -3557,6 +3558,11 @@ class MuzykaApp(App):
 
     def on_resume(self):
         self.in_bg = False
+        try:
+            if time.time() - float(self.lib.get_setting("aktualizacja_sprawdzona", "0") or 0) > 6 * 3600:
+                Clock.schedule_once(lambda dt: self.check_update(), 2)
+        except ValueError:
+            pass
         if time.time() - getattr(self, "last_scan", 0) > 20:
             Clock.schedule_once(lambda dt: self.scan(), 0.3)   # nowe pliki, przyznany dostęp
         if self.bg_changed and not self.apk:
@@ -5034,6 +5040,7 @@ class MuzykaApp(App):
         rows = [
             ("Społeczność: czat, wspólna muzyka, profil" + (" (ADMIN)" if self.is_admin() else ""),
              lambda b: self.show_online()),
+            (f"Sprawdź aktualizacje (masz {self.app_version()})", lambda b: self.check_update(True)),
             ("Szukaj wszędzie (biblioteka, YouTube, radio)", lambda b: self.show_global_search()),
             (f"Wyślij na komputer / telewizor{' (' + self.cast.name + ')' if self.cast else ''}",
              lambda b: self.show_cast_menu()),
@@ -9643,6 +9650,110 @@ for _name, _fn in list(vars(OnlinePlus).items()):
     if not _name.startswith("__"):
         setattr(MuzykaApp, _name, _fn)
 
+
+
+# =====================================================================
+#  LEOX PLAYER - AUTOMATYCZNA AKTUALIZACJA (tylko APK)
+#  Każde budowanie na GitHubie wystawia wydanie (Release) z plikami
+#  LeoxPlayer.apk i version.json. Aplikacja sprawdza je przy starcie.
+# =====================================================================
+try:
+    from leox_build import BUILD as APP_BUILD          # numer budowania (wstawia GitHub)
+except ImportError:
+    APP_BUILD = 0
+UPDATE_INFO_URL = "https://github.com/leox1111111/leox-player/releases/latest/download/version.json"
+UPDATE_APK_URL = "https://github.com/leox1111111/leox-player/releases/download/v1.{n}/LeoxPlayer.apk"
+
+
+class UpdatePlus:
+    def app_version(self):
+        return f"1.{APP_BUILD}" if APP_BUILD else "1.0"
+
+    def check_update(self, manual=False):
+        if not getattr(self, "apk_build", False) or not APP_BUILD:
+            if manual:
+                self.set_status("Aktualizacje działają tylko w wersji APK zbudowanej na GitHubie")
+            return
+        self.lib.set_setting("aktualizacja_sprawdzona", str(time.time()))
+        if manual:
+            self.set_status("Sprawdzanie aktualizacji...")
+
+        def work():
+            return json.loads(http_get(UPDATE_INFO_URL, timeout=15).decode("utf-8"))
+
+        def done(res):
+            if isinstance(res, Exception):
+                if manual:
+                    self.set_status(f"Nie udało się sprawdzić aktualizacji: {pl_error(res)}")
+                return
+            n = int(res.get("build") or 0)
+            if n <= APP_BUILD:
+                if manual:
+                    self.set_status(f"Masz najnowszą wersję ({self.app_version()})")
+                return
+            if not manual and self.lib.get_setting("pomin_wersje", "") == str(n):
+                return
+            notes = str(res.get("notes") or "")[:300]
+            self.list_popup(f"Nowa wersja 1.{n}  (masz {self.app_version()})", [
+                {"text": f"[b]Zainstaluj teraz[/b]\n{escape_markup(notes)}", "markup": True,
+                 "h": 110, "tap": lambda b: self.do_update(n), "bg": list(ACCENT_DIM)},
+                {"text": "Pomiń tę wersję",
+                 "tap": lambda b: self.lib.set_setting("pomin_wersje", str(n))}])
+        self.run_bg(work, done)
+
+    def do_update(self, n):
+        try:
+            from jnius import autoclass
+            Upd = autoclass("pl.leox.media.LeoxUpdate")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+        except Exception as e:
+            self.set_status(f"Aktualizacja niedostępna: {e}")
+            return
+        if not Upd.canInstall(act):
+            self.list_popup("Zezwól na aktualizacje", [
+                {"text": "Android musi pozwolić Leox Player instalować aktualizacje.\n"
+                         "Dotknij, włącz \"Zezwalaj z tego źródła\", wróć i jeszcze raz wybierz Zainstaluj.",
+                 "h": 120, "tap": lambda b: Upd.openInstallSettings(act)}])
+            return
+        dest = Path(self.user_data_dir) / "aktualizacja.apk"
+        url = UPDATE_APK_URL.format(n=n)
+
+        def work():
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=60) as r:
+                total = int(r.headers.get("Content-Length") or 0)
+                got = 0
+                tmp = dest.with_suffix(".part")
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(262144)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        if total:
+                            pct = got * 100 // total
+                            Clock.schedule_once(lambda dt, p=pct: self.set_status(
+                                f"Pobieranie aktualizacji: {p}%"))
+                tmp.replace(dest)
+            return str(dest)
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.set_status(f"Nie udało się pobrać aktualizacji: {pl_error(res)}")
+                return
+            err = Upd.install(act, res)
+            if err:
+                self.set_status(f"Instalacja nie ruszyła: {err}"[:150])
+            else:
+                self.set_status("Potwierdź instalację w oknie Androida")
+        self.set_status("Pobieranie aktualizacji...")
+        self.run_bg(work, done)
+
+
+for _name, _fn in list(vars(UpdatePlus).items()):
+    if not _name.startswith("__"):
+        setattr(MuzykaApp, _name, _fn)
 
 
 if __name__ == "__main__":

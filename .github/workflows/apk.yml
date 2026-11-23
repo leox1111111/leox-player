@@ -3,6 +3,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -39,7 +42,7 @@ jobs:
           requirements = python3,kivy==2.3.0,pyjnius,android,openssl,sqlite3,yt-dlp,mutagen,certifi,qrcode
           orientation = portrait
           fullscreen = 0
-          android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CHANGE_WIFI_MULTICAST_STATE,WAKE_LOCK,READ_MEDIA_AUDIO,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE,POST_NOTIFICATIONS,RECORD_AUDIO,FOREGROUND_SERVICE,FOREGROUND_SERVICE_MEDIA_PLAYBACK
+          android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CHANGE_WIFI_MULTICAST_STATE,WAKE_LOCK,READ_MEDIA_AUDIO,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE,POST_NOTIFICATIONS,RECORD_AUDIO,REQUEST_INSTALL_PACKAGES,FOREGROUND_SERVICE,FOREGROUND_SERVICE_MEDIA_PLAYBACK
           services = Leoxplayer:service.py:foreground:sticky
           android.add_src = java
           android.api = 33
@@ -55,10 +58,25 @@ jobs:
           SPEC
           sed -i 's/^          //' buildozer.spec
           if [ -f icon.png ]; then sed -i 's|^\[app\]$|[app]\nicon.filename = %(source.dir)s/icon.png|' buildozer.spec; fi
+          N=${{ github.run_number }}
+          sed -i "s/^version = .*/version = 1.$N/" buildozer.spec
+          sed -i "s/^\[app\]$/[app]\nandroid.numeric_version = $((2000000 + N))/" buildozer.spec
+          echo "BUILD = $N" > leox_build.py
+          grep -n "version" buildozer.spec
       - name: Stały klucz podpisu
         run: mkdir -p ~/.android && cp debug.keystore ~/.android/debug.keystore
       - name: Budowanie
         run: yes | buildozer android debug 2>&1 | tee build.log; test -n "$(ls bin/*.apk 2>/dev/null)"
+      - name: Wydanie (automatyczna aktualizacja w aplikacji)
+        if: success() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          N=${{ github.run_number }}
+          cp bin/*.apk LeoxPlayer.apk
+          NOTES="$(git log -1 --pretty=%s)"
+          python3 -c "import json,sys; json.dump({'build': int(sys.argv[1]), 'version': '1.' + sys.argv[1], 'notes': sys.argv[2]}, open('version.json', 'w'), ensure_ascii=False)" "$N" "$NOTES"
+          gh release create "v1.$N" LeoxPlayer.apk version.json --title "Leox Player 1.$N" --notes "$NOTES" --latest
       - uses: actions/upload-artifact@v4
         if: always()
         with:
